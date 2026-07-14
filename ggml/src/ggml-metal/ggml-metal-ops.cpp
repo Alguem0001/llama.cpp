@@ -1624,10 +1624,30 @@ static int ggml_metal_gdn_write_rows(
     *fused_set_rows = nullptr;
 
     const ggml_tensor * gdn = ctx->node(idx);
-    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->src[6] == nullptr ||
+    // honor the backend-wide fusion switch, like every other Metal fusion
+    if (!ctx->use_fusion ||
+        gdn->op != GGML_OP_GATED_DELTA_NET || gdn->src[6] == nullptr ||
         getenv("GGML_GDN_WRITE_FOLD_DISABLE") != nullptr) {
         return 1;
     }
+
+    // expected geometry of the recurrent-ring snapshot the kernel will scatter:
+    // the GDN output is [attn scores | K state snapshots]; the fold only applies
+    // to a SET_ROWS of the snapshot tail, whose per-row width is the full state
+    // D = S_v*S_v*H_v and whose row count is min(T, K)*n_seqs.
+    const int64_t S_v      = gdn->src[2]->ne[0];     // value head dim
+    const int64_t H_v      = gdn->src[2]->ne[2];     // value heads
+    const int64_t n_seqs   = gdn->src[2]->ne[3];
+    const int64_t T        = gdn->src[0]->ne[2];     // tokens this step
+    const int64_t K        = (int64_t) ggml_get_op_params_i32(gdn, 0);
+    const int64_t D        = S_v * S_v * H_v;
+    const int64_t n_slots  = (T < K ? T : K);         // snapshot slots written
+    const int64_t n_write  = n_slots * n_seqs;
+    // byte offset of the snapshot tail within the GDN output, matching the
+    // kernel: dst = base + attn_size + (K - n_slots)*state_size_per_snap.
+    const int64_t attn_size            = T * H_v * S_v * n_seqs;
+    const int64_t state_size_per_snap  = D * n_seqs;
+    const int64_t snap_off_elems       = attn_size + (K - n_slots) * state_size_per_snap;
 
     for (int j = idx + 1; j < ctx->n_nodes(); ++j) {
         ggml_tensor * set_rows = ctx->node(j);
@@ -1645,6 +1665,32 @@ static int ggml_metal_gdn_write_rows(
         if (src != gdn || set_rows->src[1] == nullptr || set_rows->src[2] == nullptr ||
             set_rows->src[1]->type != GGML_TYPE_I64 || set_rows->src[2]->type != GGML_TYPE_F32 ||
             set_rows->src[2]->buffer == nullptr || set_rows->src[2]->data == nullptr) {
+            continue;
+        }
+
+        // Descent from the GDN output is necessary but NOT sufficient: a caller
+        // could scatter a differently-shaped view, or a same-sized view at a
+        // different offset (e.g. an attention-output slice). Verify the fold
+        // target is exactly the snapshot tail -- per-row state width, index
+        // count, destination row width, AND that the view begins at the
+        // snapshot-tail byte offset within the GDN output (tensors are
+        // allocated at encode time, so the data pointers are valid here).
+        // The fused epilogue scatters the CONTIGUOUS snapshot tail, but
+        // ggml_set_rows only requires contiguous rows (nb[0]); it permits an
+        // arbitrary row stride nb[1] that its own kernel would honor. Require
+        // the compact [D, n_write] layout (row width D, unit element stride,
+        // row stride == D) so a strided view is left to the real SET_ROWS.
+        const ggml_tensor * view = set_rows->src[0];
+        const size_t ts = ggml_type_size(view->type);
+        if (ggml_nelements(view) != D * n_write ||
+            view->ne[0] != D || view->nb[0] != ts || view->nb[1] != (size_t) D * ts ||
+            set_rows->src[1]->ne[0] != n_write ||
+            set_rows->src[2]->ne[0] != D) {
+            continue;
+        }
+        if (view->data == nullptr || gdn->data == nullptr ||
+            (size_t) ((const char *) view->data - (const char *) gdn->data) !=
+                (size_t) snap_off_elems * sizeof(float)) {
             continue;
         }
 
