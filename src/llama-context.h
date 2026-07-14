@@ -122,7 +122,7 @@ struct llama_context {
 
     // register the ordered set of intermediate layers to capture. pass an empty
     // list to disable. the concatenation order follows the order of layer_ids.
-    void set_capture_layers(const std::vector<int32_t> & layer_ids);
+    void set_capture_layers(const std::vector<int32_t> & layer_ids, bool masked = true);
 
     // dspark drafter: stage the target-tap context window consumed by the next
     // decode() call. feat is [n_ctx_rows * n_embd_cap] row-major (row i is

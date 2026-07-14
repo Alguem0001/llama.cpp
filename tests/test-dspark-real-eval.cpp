@@ -286,8 +286,12 @@ int main(int argc, char ** argv) {
 
     // engage the target-layer tap capture ONCE, permanently, on the target
     // context (see file header comment -- this is the missing piece no
-    // existing CLI/server path wires up for dspark).
-    llama_set_capture_layers(ctx_tgt, target_layers.data(), target_layers.size());
+    // existing CLI/server path wires up for dspark). masked=false: capture stays
+    // dense (every prompt position) independent of batch.logits, so the prefill
+    // below can request logits=false on context rows like the AR baseline does,
+    // instead of paying a full-vocab lm_head projection on every prompt position
+    // just to get a capture row for it (see PrismML-Eng/llama.cpp-private#33).
+    llama_set_capture_layers(ctx_tgt, target_layers.data(), target_layers.size(), /* masked = */ false);
 
     common_params_speculative sparams;
     sparams.types          = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
@@ -368,7 +372,8 @@ int main(int argc, char ** argv) {
         // overhead, i.e. it is genuinely comparable to plain decoding, not
         // "dspark plumbing with drafting turned off". ===
         llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, 0, -1);
-        llama_set_capture_layers(ctx_tgt, nullptr, 0);
+        llama_set_capture_layers(ctx_tgt, nullptr, 0,
+                                 /* masked = */ true);  // disabling (n_layers=0); masked value unused
 
         const auto t_ar0 = std::chrono::steady_clock::now();
 
@@ -406,7 +411,7 @@ int main(int argc, char ** argv) {
 
         // === DSpark pass (existing logic below, now timed) ===
         llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, 0, -1);
-        llama_set_capture_layers(ctx_tgt, target_layers.data(), target_layers.size());
+        llama_set_capture_layers(ctx_tgt, target_layers.data(), target_layers.size(), /* masked = */ false);
 
         const auto t_sp0 = std::chrono::steady_clock::now();
 
@@ -414,12 +419,17 @@ int main(int argc, char ** argv) {
 
         common_sampler_ptr smpl(common_sampler_init(model_tgt, sparams_smpl));
 
-        // manual prefill with per-row logits requested (llama_batch_get_one()
-        // only requests the last row -- dspark's process() needs a capture
-        // row for EVERY prompt position, see common/speculative.cpp).
+        // manual prefill, logits=false on every context row (same as the AR
+        // baseline above) -- none of these rows are sampled from here (id_last is
+        // staged separately via dp.id_last below and verified in its own batch),
+        // and dense capture (masked=false, set above) no longer needs logits=true
+        // to populate a capture row for every position. Previously this requested
+        // logits=true on every row solely to get a capture row for it, which forced
+        // the full-vocab lm_head projection ~n_prompt_tokens times instead of the
+        // AR baseline's 1 -- see PrismML-Eng/llama.cpp-private#33.
         common_batch_clear(batch_tgt);
         for (size_t i = 0; i < prompt_tgt.size(); ++i) {
-            common_batch_add(batch_tgt, prompt_tgt[i], (llama_pos) i, { seq_id }, /* logits = */ true);
+            common_batch_add(batch_tgt, prompt_tgt[i], (llama_pos) i, { seq_id }, /* logits = */ false);
         }
         if (llama_decode(ctx_tgt, batch_tgt) != 0) fail("prefill decode failed for prompt " + std::to_string(pi));
         if (!common_speculative_process(spec, batch_tgt)) fail("common_speculative_process (prefill) failed for prompt " + std::to_string(pi));

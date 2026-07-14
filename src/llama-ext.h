@@ -114,7 +114,18 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 // This is the shared primitive both EAGLE3-proper and dspark consume: where the
 // pre-norm path above exposes one final-layer hidden vector, this exposes an
 // arbitrary set of intermediate layers in one concatenated row.
-LLAMA_API void     llama_set_capture_layers(struct llama_context * ctx, const int32_t * layer_ids, size_t n_layers);
+// If masked == true (default), capture is narrowed to output rows (batch.logits
+// != 0) at the tap point -- requesting a capture row for every position therefore
+// also forces every one of those rows through the final norm + lm_head. If
+// masked == false, capture stays dense (every position, regardless of
+// batch.logits) and the output-row narrowing is deferred to just before lm_head,
+// so batch.logits can stay narrow (e.g. only the sampled row) while still getting
+// a full per-position capture buffer -- avoids the wasted full-vocab projection
+// on rows that are only needed for their capture features, not their logits.
+LLAMA_API void            llama_set_capture_layers(struct llama_context * ctx,
+                                                   const int32_t *        layer_ids,
+                                                   size_t                 n_layers,
+                                                   bool                   masked = true);
 LLAMA_API uint32_t llama_get_n_capture(struct llama_context * ctx);
 // mirrors llama_get_embeddings_nextn / _ith
 LLAMA_API float *  llama_get_embeddings_capture    (struct llama_context * ctx);

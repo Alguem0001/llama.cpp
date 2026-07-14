@@ -158,6 +158,43 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     // capture order, then concatenate them along dim0 after the layer loop.
     std::vector<ggml_tensor *> h_capture(cparams.n_capture_layers, nullptr);
 
+    // The last-layer residual stream and the final norm+lm_head can only be
+    // narrowed to output rows (inp_out_ids) *before* the last layer runs if every
+    // active consumer of the un-narrowed rows agrees to that -- i.e. embeddings_nextn
+    // wants the masked (narrow-early) layout, AND capture is either inactive or
+    // also wants it narrowed at the tap point. Capture only cares about this at all
+    // if the LAST layer itself is one of the requested capture layers -- taps at any
+    // earlier layer have already branched off `cur` before this point in the loop
+    // (see the per-layer tap below), so narrowing the last layer's own compute doesn't
+    // touch them. If a dense (embeddings_capture_masked == false) tap of the last
+    // layer specifically is requested while embeddings_nextn_masked is on, narrowing
+    // early would clip that dense row too (they share inp_out_ids at the same point),
+    // so defer to the post-loop narrowing instead -- capture then sees the full,
+    // unnarrowed last-layer output and only the final projection (result_norm +
+    // lm_head) is limited to inp_out_ids.
+    bool capture_taps_last_layer = false;
+    for (uint32_t c = 0; c < cparams.n_capture_layers; ++c) {
+        if (cparams.capture_layer_idx[c] == n_layer - 1) {
+            capture_taps_last_layer = true;
+            break;
+        }
+    }
+    const bool capture_wants_dense = capture_taps_last_layer && !cparams.embeddings_capture_masked;
+
+    // t_h_nextn's readback (llama-context.cpp) trusts embeddings_nextn_masked to know
+    // whether t_h_nextn is narrow (n_outputs rows) or full-width (ubatch.n_tokens rows);
+    // t_h_nextn is assigned from `cur` right after this loop, so it inherits whatever
+    // narrow_before_last_layer decided. If nextn is simultaneously active and asked for
+    // the narrow layout, letting capture's dense request silently widen `cur` here would
+    // widen t_h_nextn too without nextn's own readback knowing -- wrong offsets, not just
+    // wrong rows. DSpark capture and MTP nextn are never engaged together in practice; fail
+    // loudly instead of silently corrupting nextn's output if that assumption is ever broken.
+    GGML_ASSERT(!(capture_wants_dense && cparams.embeddings_nextn && cparams.embeddings_nextn_masked) &&
+                "dspark dense capture (embeddings_capture_masked=false) is incompatible with simultaneous "
+                "masked MTP nextn extraction -- they share the same narrow-timing decision");
+
+    const bool narrow_before_last_layer = cparams.embeddings_nextn_masked && !capture_wants_dense;
+
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
@@ -176,7 +213,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+        if (il == n_layer - 1 && inp_out_ids && narrow_before_last_layer) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -214,7 +251,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         for (uint32_t c = 0; c < cparams.n_capture_layers; ++c) {
             if (cparams.capture_layer_idx[c] == il) {
                 ggml_tensor * cap = cur;
-                if (cparams.embeddings_nextn_masked && inp_out_ids) {
+                if (cparams.embeddings_capture_masked && inp_out_ids) {
                     cap = ggml_get_rows(ctx0, cap, inp_out_ids);
                 }
                 cb(cap, "h_capture", il);
@@ -249,7 +286,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         ggml_build_forward_expand(gf, cap);
     }
 
-    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+    if (!narrow_before_last_layer && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 

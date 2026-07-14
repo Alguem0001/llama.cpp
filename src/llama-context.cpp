@@ -996,8 +996,16 @@ float * llama_context::get_embeddings_capture_ith(int32_t i) {
         const uint32_t n_embd = model.hparams.n_embd;
         const uint32_t row    = n_cap * n_embd; // width of one concatenated row
 
-        // capture rows always follow the masked (output-row) layout, mirroring the
-        // pre-norm masked path: the buffer holds one row per output position.
+        if (!cparams.embeddings_capture_masked) {
+            // unmasked: capture rows are stored densely, indexed by raw token
+            // position, mirroring get_embeddings_nextn_ith's unmasked path.
+            if (i < 0 || (size_t) (i + 1) * row > embd_capture.size) {
+                throw std::runtime_error(format("out of range [0, %zu)", embd_capture.size / row));
+            }
+            return embd_capture.data + (size_t) i * row;
+        }
+
+        // masked (default): the buffer holds one row per output position.
         const int64_t j = output_resolve_row(i);
         if (j < 0 || (size_t)(j + 1) * row > embd_capture.size) {
             throw std::runtime_error(format("out of range [0, %zu)", embd_capture.size / row));
@@ -1196,11 +1204,12 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
     cparams.embeddings_nextn_masked = masked;
 }
 
-void llama_context::set_capture_layers(const std::vector<int32_t> & layer_ids) {
+void llama_context::set_capture_layers(const std::vector<int32_t> & layer_ids, bool masked) {
     // reset
-    cparams.embeddings_capture = false;
-    cparams.n_capture_layers   = 0;
-    cparams.capture_layer_idx  = {};
+    cparams.embeddings_capture        = false;
+    cparams.n_capture_layers          = 0;
+    cparams.capture_layer_idx         = {};
+    cparams.embeddings_capture_masked = masked;
 
     // enabling/disabling capture adds/removes the t_h_capture node from the
     // graph (see llm_graph_result::set_outputs()), so the scheduler's
@@ -1236,8 +1245,6 @@ void llama_context::set_capture_layers(const std::vector<int32_t> & layer_ids) {
 
     cparams.n_capture_layers   = n;
     cparams.embeddings_capture = n > 0;
-    // capture rows reuse the masked output-row layout; force masked extraction on.
-    cparams.embeddings_nextn_masked = true;
 }
 
 void llama_context::set_dspark_ctx(
@@ -2103,33 +2110,57 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        // extract multi-layer capture embeddings, concatenated per output position.
-        // capture always uses the masked (output-row) layout, so t_h_capture is
-        // [n_capture * n_embd, n_outputs]; copy in one shot per ubatch.
-        if (embd_capture.data && cparams.n_capture_layers > 0 && n_outputs > 0 &&
+        // extract multi-layer capture embeddings, concatenated per position.
+        // masked (default): t_h_capture is [n_capture * n_embd, n_outputs], one row
+        // per output position. unmasked: t_h_capture is dense, one row per raw
+        // ubatch token regardless of batch.logits -- mirrors the t_h_nextn
+        // masked/unmasked split above.
+        {
+            const bool    cap_masked = cparams.embeddings_capture_masked;
+            const int64_t n_rows_cap = cap_masked ? n_outputs : (int64_t) ubatch.n_tokens;
+            const int64_t offset_cap = cap_masked ? n_outputs_prev : n_tokens_prev;
+
+            // Dense (unmasked) rows are stored and later indexed in raw ubatch-token
+            // order (get_embeddings_capture_ith(i) reads row i directly), and
+            // output_reorder()'s swap list is built to fix up *output-row* order --
+            // neither accounts for split_equal()'s per-sequence interleaving of a
+            // multi-sequence ubatch (llama-batch.cpp), so a dense capture row for
+            // token i could come from the wrong sequence, or get scrambled by an
+            // output-row swap meant for a different token. Every current dense
+            // capture consumer (dspark) is single-sequence; fail loudly rather than
+            // silently return another sequence's capture if that ever changes.
+            GGML_ASSERT((cap_masked || ubatch.n_seqs_unq <= 1) &&
+                        "dense (unmasked) capture is only validated for single-sequence ubatches; "
+                        "multi-sequence interleaving is not accounted for in its row ordering");
+
+            if (embd_capture.data && cparams.n_capture_layers > 0 && n_rows_cap > 0 &&
                 cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
-            ggml_tensor * t_cap = res->get_h_capture();
-            const size_t row = (size_t) cparams.n_capture_layers * hparams.n_embd;
-            float * embd_capture_out = embd_capture.data + (size_t) n_outputs_prev * row;
-            GGML_ASSERT((n_outputs_prev + n_outputs)*(int64_t) row <= (int64_t) embd_capture.size);
-            if (t_cap) {
-                ggml_backend_t backend_c = ggml_backend_sched_get_tensor_backend(sched.get(), t_cap);
-                GGML_ASSERT(backend_c != nullptr);
-                ggml_backend_tensor_get_async(backend_c, t_cap, embd_capture_out, 0, n_outputs*row*sizeof(float));
-            } else {
-                // capture was requested (n_capture_layers > 0) but this model's
-                // graph never produced a capture tensor -- only qwen35 builds it.
-                // output_reserve() already allocated embd_capture, so zero the
-                // rows for this ubatch rather than leave uninitialized memory that
-                // llama_get_embeddings_capture*() would hand back. Warn once so the
-                // misconfiguration (capture on an unsupported arch) is visible.
-                static bool warned_no_capture = false;
-                if (!warned_no_capture) {
-                    LLAMA_LOG_WARN("%s: capture layers were requested but this architecture does not "
-                            "produce capture embeddings; returning zeros\n", __func__);
-                    warned_no_capture = true;
+                ggml_tensor * t_cap            = res->get_h_capture();
+                const size_t  row              = (size_t) cparams.n_capture_layers * hparams.n_embd;
+                float *       embd_capture_out = embd_capture.data + (size_t) offset_cap * row;
+                GGML_ASSERT((offset_cap + n_rows_cap) * (int64_t) row <= (int64_t) embd_capture.size);
+                if (t_cap) {
+                    ggml_backend_t backend_c = ggml_backend_sched_get_tensor_backend(sched.get(), t_cap);
+                    GGML_ASSERT(backend_c != nullptr);
+                    ggml_backend_tensor_get_async(backend_c, t_cap, embd_capture_out, 0,
+                                                  n_rows_cap * row * sizeof(float));
+                } else {
+                    // capture was requested (n_capture_layers > 0) but this model's
+                    // graph never produced a capture tensor -- only qwen35 builds it.
+                    // output_reserve() already allocated embd_capture, so zero the
+                    // rows for this ubatch rather than leave uninitialized memory that
+                    // llama_get_embeddings_capture*() would hand back. Warn once so the
+                    // misconfiguration (capture on an unsupported arch) is visible.
+                    static bool warned_no_capture = false;
+                    if (!warned_no_capture) {
+                        LLAMA_LOG_WARN(
+                            "%s: capture layers were requested but this architecture does not "
+                            "produce capture embeddings; returning zeros\n",
+                            __func__);
+                        warned_no_capture = true;
+                    }
+                    memset(embd_capture_out, 0, n_rows_cap * row * sizeof(float));
                 }
-                memset(embd_capture_out, 0, n_outputs*row*sizeof(float));
             }
         }
 
@@ -2245,6 +2276,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         // unmasked: nextn row exists for every token in the batch, not just
         // those flagged via batch.logits[i] -> size by token count instead.
         embd_nextn.size = (size_t) n_embd_out * n_batch;
+    }
+
+    if (has_embd_capture && !cparams.embeddings_capture_masked) {
+        // unmasked: same as embeddings_nextn above -- a capture row exists for
+        // every token in the batch, not just output rows, so size by token count.
+        embd_capture.size = (size_t) cparams.n_capture_layers * model.hparams.n_embd * n_batch;
     }
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
@@ -3989,13 +4026,13 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
 
 // multi-layer hidden-state tap C API (staging) -------------------------------
 
-void llama_set_capture_layers(llama_context * ctx, const int32_t * layer_ids, size_t n_layers) {
+void llama_set_capture_layers(llama_context * ctx, const int32_t * layer_ids, size_t n_layers, bool masked) {
     std::vector<int32_t> ids;
     ids.reserve(n_layers);
     for (size_t i = 0; i < n_layers; ++i) {
         ids.push_back(layer_ids[i]);
     }
-    ctx->set_capture_layers(ids);
+    ctx->set_capture_layers(ids, masked);
 }
 
 uint32_t llama_get_n_capture(llama_context * ctx) {
