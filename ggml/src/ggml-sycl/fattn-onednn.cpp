@@ -24,7 +24,8 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst) {
     // https://github.com/uxlfoundation/oneDNN/issues/5510. Remove this hardware limitation once that
     // is fixed; until then non-BMG archs fall back to the existing FA kernel.
     const gpu_arch arch = ggml_sycl_info().devices[ggml_sycl_get_device()].hw_info.arch;
-    if (arch != gpu_arch::intel_gpu_bmg_g21 && arch != gpu_arch::intel_gpu_bmg_g31) {
+    // oneAPI 2025.1 headers expose bmg_g21 only (B570/B580); g31 not yet defined.
+    if (arch != gpu_arch::intel_gpu_bmg_g21) {
         return false;
     }
     const ggml_tensor * Q     = dst->src[0];

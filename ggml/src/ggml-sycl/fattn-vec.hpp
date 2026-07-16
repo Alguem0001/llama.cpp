@@ -17,8 +17,8 @@ namespace syclex = sycl::ext::oneapi::experimental;
 
 static int ggml_sycl_fattn_vec_get_nthreads_device(gpu_arch arch) {
     // Xe2 (Battlemage, Lunar Lake) runs the flash-attention vec kernel best with a 256-thread work group.
+    // Note: intel_gpu_bmg_g31 is not in oneAPI 2025.1 headers yet (only bmg_g21).
     return (arch == gpu_arch::intel_gpu_bmg_g21 ||
-            arch == gpu_arch::intel_gpu_bmg_g31 ||
             arch == gpu_arch::intel_gpu_lnl_m) ? 256 : 128;
 }
 

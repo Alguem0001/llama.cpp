@@ -34,9 +34,11 @@ $bat = @"
 @echo off
 call "$setvars" --force
 cd /d "$Root"
+REM Windows: use icx for both (MSVC-like). Linux would use icpx for CXX.
+set "VS2022INSTALLDIR=$env:VS2022INSTALLDIR"
 cmake -B $BuildDir -G Ninja ^
   -DCMAKE_C_COMPILER=icx ^
-  -DCMAKE_CXX_COMPILER=icpx ^
+  -DCMAKE_CXX_COMPILER=icx ^
   -DCMAKE_BUILD_TYPE=Release ^
   -DGGML_SYCL=ON ^
   -DGGML_SYCL_F16=ON ^
@@ -46,7 +48,11 @@ cmake -B $BuildDir -G Ninja ^
 if errorlevel 1 exit /b 1
 cmake --build $BuildDir -j --target llama-server llama-bench
 "@
+# Inject VS path for setvars
+$vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+$env:VS2022INSTALLDIR = $vs
 $tmp = Join-Path $env:TEMP "build-sycl-llama.bat"
+$bat = $bat -replace 'call "\$setvars" --force', "set `"VS2022INSTALLDIR=$vs`"`r`ncall `"$setvars`" --force"
 $bat | Set-Content $tmp -Encoding ASCII
 cmd /c $tmp
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

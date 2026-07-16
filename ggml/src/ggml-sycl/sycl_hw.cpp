@@ -32,11 +32,10 @@ static map<gpu_arch, std::pair<const char*, sycl_intel_gpu_family>> arch2name = 
     {gpu_arch::intel_gpu_mtl_h,   {"intel_gpu_mtl_h",   GPU_FAMILY_IGPU_XE}},
     {gpu_arch::intel_gpu_arl_h,   {"intel_gpu_arl_h",   GPU_FAMILY_IGPU_XE}},
     {gpu_arch::intel_gpu_bmg_g21, {"intel_gpu_bmg_g21", GPU_FAMILY_DGPU_CLIENT_GAME}},
-    {gpu_arch::intel_gpu_bmg_g31, {"intel_gpu_bmg_g31", GPU_FAMILY_DGPU_CLIENT_GAME}},
     {gpu_arch::intel_gpu_lnl_m,   {"intel_gpu_lnl_m",   GPU_FAMILY_IGPU_XE}},
     {gpu_arch::intel_gpu_ptl_h,   {"intel_gpu_ptl_h",   GPU_FAMILY_IGPU_XE}},
     {gpu_arch::intel_gpu_ptl_u,   {"intel_gpu_ptl_u",   GPU_FAMILY_IGPU_XE}},
-    {gpu_arch::intel_gpu_wcl,     {"intel_gpu_wcl",     GPU_FAMILY_IGPU_XE}}
+    // intel_gpu_bmg_g31 / intel_gpu_wcl: not in oneAPI 2025.1 headers
 };
 
 
