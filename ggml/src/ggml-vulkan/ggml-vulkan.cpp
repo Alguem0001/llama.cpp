@@ -3436,9 +3436,19 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     result.path = FA_SCALAR;
 
     if (device->vendor_id == VK_VENDOR_ID_INTEL) {
-        // Disable subgroup use due to performance issues when enforcing subgroup sizes
-        result.subgroup_size = 32;
-        result.disable_subgroups = true;
+        // ARC-SPEED (Alguem0001/llama.cpp-arc-speed):
+        // Xe2 (Battlemage B570/B580) is SIMD16 — upstream disables subgroups for all Intel
+        // because Xe1/Gen had bad performance when forcing subgroup sizes. On Xe2, try
+        // enabling subgroup-aware FA (override with GGML_VK_ARC_FA_LEGACY=1).
+        const bool arc_fa_legacy = getenv("GGML_VK_ARC_FA_LEGACY") != nullptr;
+        if (!arc_fa_legacy && device->architecture == INTEL_XE2) {
+            result.subgroup_size = device->subgroup_size >= 16 ? 16 : device->subgroup_size;
+            result.disable_subgroups = false;
+        } else {
+            // Xe1 / Gen / legacy: disable subgroup use due to performance issues
+            result.subgroup_size = 32;
+            result.disable_subgroups = true;
+        }
     } else if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN) {
         result.subgroup_size = n_rows < 4 ? 32 : device->subgroup_size;
     } else {
@@ -3460,7 +3470,11 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 
     const uint32_t D = hsk | hsv;
 
-    const bool reduce_block_rows = D & 8 || n_kv < 1024 || device->vendor_id == VK_VENDOR_ID_INTEL;
+    // ARC-SPEED: on Xe2 allow larger block_rows (better occupancy) unless legacy FA mode
+    const bool intel_reduce_rows =
+        device->vendor_id == VK_VENDOR_ID_INTEL &&
+        (device->architecture != INTEL_XE2 || getenv("GGML_VK_ARC_FA_LEGACY") != nullptr);
+    const bool reduce_block_rows = D & 8 || n_kv < 1024 || intel_reduce_rows;
 
     if (n_rows == 1) {
         result.block_rows = 1;
