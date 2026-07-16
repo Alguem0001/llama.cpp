@@ -294,6 +294,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_qwen35moe(params);
         case LLM_ARCH_MISTRAL3:
             return new llama_model_mistral3(params);
+        case LLM_ARCH_DSPARK:
+            return new llama_model_dspark(params);
         case LLM_ARCH_EAGLE3:
             return new llama_model_eagle3(params);
         case LLM_ARCH_DFLASH:
@@ -2486,6 +2488,10 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GLM_DSA:
             return LLAMA_ROPE_TYPE_NORM;
 
+        // dspark trunk is plain Qwen3-style NEOX RoPE
+        case LLM_ARCH_DSPARK:
+            return LLAMA_ROPE_TYPE_NEOX;
+
         // the pairs of head values are offset by n_rot/2
         case LLM_ARCH_FALCON:
         case LLM_ARCH_FALCON_H1:
@@ -2777,4 +2783,95 @@ const int32_t * llama_model_target_layer_ids(const struct llama_model * model) {
 
 uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
     return (uint32_t) model->target_layer_ids.size();
+}
+
+bool llama_model_dspark_get_meta(const llama_model * model, llama_dspark_meta * out) {
+    if (model == nullptr || out == nullptr) {
+        return false;
+    }
+
+    const auto & hp = model->hparams;
+    if (hp.dspark_block_size == 0) {
+        return false; // not a dspark model
+    }
+
+    // dspark ships no tokenizer (converter calls _set_vocab_none(): it ties to
+    // the TARGET model's vocab), so the real vocab width only exists as
+    // token_embd.weight's own shape -- mirrors src/models/dspark.cpp's
+    // load_arch_tensors and tests/test-dspark-forward.cpp's n_vocab_from_model.
+    const ggml_tensor * tok_embd = model->get_tensor("token_embd.weight");
+    if (tok_embd == nullptr) {
+        return false;
+    }
+
+    out->n_embd        = hp.n_embd;
+    out->n_vocab       = tok_embd->ne[1];
+    out->n_capture     = hp.n_dspark_target_layers;
+    out->n_embd_cap    = out->n_capture * out->n_embd;
+    out->block_size    = (int32_t) hp.dspark_block_size;
+    out->mask_token_id = (int32_t) hp.dspark_mask_token_id;
+    out->markov_rank   = hp.dspark_markov_rank;
+
+    return true;
+}
+
+bool llama_model_dspark_get_markov(
+        const llama_model  * model,
+        std::vector<float> & w1,
+        std::vector<float> & w2) {
+    if (model == nullptr || model->hparams.dspark_markov_rank == 0) {
+        return false;
+    }
+
+    const ggml_tensor * a = model->dspark_markov_head_a;
+    const ggml_tensor * b = model->dspark_markov_head_b;
+    if (a == nullptr || b == nullptr) {
+        return false;
+    }
+
+    GGML_ASSERT(a->ne[0] == b->ne[0] && a->ne[1] == b->ne[1] &&
+            "dspark: markov_head_a/b shape mismatch");
+
+    auto copy_to_f32 = [](const ggml_tensor * t, std::vector<float> & out) -> bool {
+        const int64_t n = ggml_nelements(t);
+        out.resize((size_t) n);
+
+        switch (t->type) {
+            case GGML_TYPE_F32:
+                ggml_backend_tensor_get(t, out.data(), 0, (size_t) n * sizeof(float));
+                return true;
+            case GGML_TYPE_F16: {
+                std::vector<ggml_fp16_t> tmp((size_t) n);
+                ggml_backend_tensor_get(t, tmp.data(), 0, (size_t) n * sizeof(ggml_fp16_t));
+                ggml_fp16_to_fp32_row(tmp.data(), out.data(), n);
+                return true;
+            }
+            case GGML_TYPE_BF16: {
+                std::vector<ggml_bf16_t> tmp((size_t) n);
+                ggml_backend_tensor_get(t, tmp.data(), 0, (size_t) n * sizeof(ggml_bf16_t));
+                ggml_bf16_to_fp32_row(tmp.data(), out.data(), n);
+                return true;
+            }
+            default:
+                if (!ggml_is_quantized(t->type)) {
+                    LLAMA_LOG_ERROR("%s: unsupported markov head tensor type %s\n",
+                            __func__, ggml_type_name(t->type));
+                    return false;
+                }
+
+                const auto * qtype = ggml_get_type_traits(t->type);
+                if (qtype == nullptr || qtype->to_float == nullptr) {
+                    LLAMA_LOG_ERROR("%s: quantized markov head tensor type %s has no dequantizer\n",
+                            __func__, ggml_type_name(t->type));
+                    return false;
+                }
+
+                std::vector<uint8_t> raw(ggml_nbytes(t));
+                ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+                qtype->to_float(raw.data(), out.data(), n);
+                return true;
+        }
+    };
+
+    return copy_to_f32(a, w1) && copy_to_f32(b, w2);
 }

@@ -367,6 +367,9 @@ extern "C" {
         void * cb_eval_user_data;
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
+
+    // path to optional K-cache mean-centering bias GGUF (Q4_0 K cache only); see docs/kv-mean-center.md
+    const char * path_kv_mean_center;
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         // Abort callback

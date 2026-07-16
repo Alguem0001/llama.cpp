@@ -56,6 +56,8 @@ set(TARGET llama-common)
 add_library(${TARGET}
     arg.cpp
     arg.h
+    kv-mean-center.cpp
+    kv-mean-center.h
     base64.hpp
     chat-auto-parser-generator.cpp
     chat-auto-parser-helpers.cpp
@@ -168,3 +170,9 @@ if (LLAMA_LLGUIDANCE)
 endif()
 
 target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
+
+# PrismML DSpark Markov CUDA resample (optional)
+if (GGML_CUDA)
+    target_sources(llama-common PRIVATE dspark-markov.cu)
+    target_compile_definitions(llama-common PUBLIC LLAMA_DSPARK_MARKOV_CUDA=1)
+endif()

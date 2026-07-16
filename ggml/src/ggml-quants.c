@@ -5665,3 +5665,58 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
 
     return true;
 }
+
+
+// ---------------------------------------------------------------------------
+// PQ2_0: PrismML group-128 ternary (same packing as historical fork Q2_0)
+// ---------------------------------------------------------------------------
+void quantize_row_pq2_0_ref(const float * GGML_RESTRICT x, block_pq2_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QKP2_0 == 0);
+    const int64_t nb = k / QKP2_0;
+    for (int64_t i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < QKP2_0; j++) {
+            const float ax = fabsf(x[i*QKP2_0 + j]);
+            amax = MAX(amax, ax);
+        }
+        const float d = amax / 2.0f; // codes map to {-1,0,1,2} so scale = amax/2
+        const float id = d ? 1.0f/d : 0.0f;
+        y[i].d = GGML_FP32_TO_FP16(d);
+        for (int j = 0; j < QKP2_0; j += 4) {
+            uint8_t byte = 0;
+            for (int q = 0; q < 4; q++) {
+                float v = x[i*QKP2_0 + j + q] * id;
+                int c = (int) roundf(v + 1.0f); // map s in {-1,0,1,2} -> c in {0,1,2,3}
+                c = MAX(0, MIN(3, c));
+                byte |= (uint8_t)(c << (2*q));
+            }
+            y[i].qs[j/4] = byte;
+        }
+    }
+}
+
+void dequantize_row_pq2_0(const block_pq2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QKP2_0 == 0);
+    const int64_t nb = k / QKP2_0;
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < QKP2_0; j += 4) {
+            const uint8_t byte = x[i].qs[j/4];
+            y[i*QKP2_0 + j + 0] = ((int)((byte >> 0) & 3) - 1) * d;
+            y[i*QKP2_0 + j + 1] = ((int)((byte >> 2) & 3) - 1) * d;
+            y[i*QKP2_0 + j + 2] = ((int)((byte >> 4) & 3) - 1) * d;
+            y[i*QKP2_0 + j + 3] = ((int)((byte >> 6) & 3) - 1) * d;
+        }
+    }
+}
+
+size_t quantize_pq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    assert(n_per_row % QKP2_0 == 0);
+    char * qrow = (char *) dst;
+    for (int64_t b = 0; b < nrows; b++) {
+        quantize_row_pq2_0_ref(src + b*n_per_row, (block_pq2_0 *) qrow, n_per_row);
+        qrow += (n_per_row/QKP2_0) * sizeof(block_pq2_0);
+    }
+    return nrows * (n_per_row/QKP2_0) * sizeof(block_pq2_0);
+}

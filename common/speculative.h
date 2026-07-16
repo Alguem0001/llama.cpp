@@ -64,6 +64,9 @@ bool common_speculative_need_embd(common_speculative * spec);
 // true if any implementation requires target nextn embeddings to be extracted
 bool common_speculative_need_embd_nextn(common_speculative * spec);
 
+// true if any implementation requires the target multi-layer tap capture (DSpark)
+bool common_speculative_need_embd_capture(common_speculative * spec);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
@@ -98,3 +101,18 @@ private:
 using common_speculative_init_result_ptr = std::unique_ptr<common_speculative_init_result>;
 
 common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+
+// PrismML DSpark speculative drafter support (see docs/dspark-scope.md)
+bool common_speculative_dspark_stage_ctx_test(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        const float * feat,
+        int64_t n_rows,
+        int64_t n_embd_cap,
+        const int32_t * pos);
+
+struct common_speculative_dspark_params {
+    bool enabled = false;
+    int  n_draft = 0;
+};
+

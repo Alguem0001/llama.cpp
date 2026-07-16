@@ -146,6 +146,7 @@ enum llm_arch {
     LLM_ARCH_MELLUM,
     LLM_ARCH_EAGLE3,
     LLM_ARCH_DFLASH,
+    LLM_ARCH_DSPARK,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -373,6 +374,16 @@ enum llm_kv {
     LLM_KV_DENSE_2_FEAT_OUT,
     LLM_KV_DENSE_3_FEAT_IN,
     LLM_KV_DENSE_3_FEAT_OUT,
+    LLM_KV_DSPARK_BLOCK_SIZE,
+    LLM_KV_DSPARK_MASK_TOKEN_ID,
+    LLM_KV_DSPARK_TARGET_LAYERS,
+    LLM_KV_DSPARK_MARKOV_RANK,
+    LLM_KV_DSPARK_CONFIDENCE_HEAD,
+    LLM_KV_DSPARK_CONFIDENCE_WITH_MARKOV,
+    LLM_KV_DSPARK_LOG_SNR_CONDITIONING,
+    LLM_KV_DSPARK_MIN_LOG_SNR,
+    LLM_KV_DSPARK_MAX_LOG_SNR,
+
 };
 
 enum llm_tensor {
@@ -619,6 +630,14 @@ enum llm_tensor_layer {
     LLM_TENSOR_LAYER_INPUT,
     LLM_TENSOR_LAYER_REPEATING,
     LLM_TENSOR_LAYER_OUTPUT,
+    LLM_TENSOR_DSPARK_FC,              // [n_capture * target_hidden, hidden] feature projection
+    LLM_TENSOR_DSPARK_HIDDEN_NORM,    // RMSNorm after fc
+    LLM_TENSOR_DSPARK_MARKOV_HEAD_A,  // low-rank logit-bias factor A
+    LLM_TENSOR_DSPARK_MARKOV_HEAD_B,  // low-rank logit-bias factor B
+    LLM_TENSOR_DSPARK_CONFIDENCE_HEAD, // accept-rate predictor
+    LLM_TENSOR_DSPARK_LOG_SNR_FC1,     // GIDD log-SNR embed: [n_freq -> hidden]
+    LLM_TENSOR_DSPARK_LOG_SNR_FC2,     // GIDD log-SNR embed: [hidden -> hidden]
+
 };
 
 struct LLM_KV {

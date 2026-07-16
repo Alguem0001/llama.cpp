@@ -124,3 +124,64 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+
+struct llama_dspark_meta {
+    int64_t n_embd        = 0;
+    int64_t n_vocab       = 0; // from token_embd.weight's own shape, not the (empty) vocab
+    int64_t n_capture     = 0; // target_layer_ids count
+    int64_t n_embd_cap    = 0; // n_capture * n_embd (raw pre-fc tap width)
+    int32_t block_size    = 0;
+    int32_t mask_token_id = 0;
+    int64_t markov_rank   = 0; // 0 if the checkpoint has no markov head
+};
+// Returns false if `model` is not a loaded dspark model (block_size == 0).
+LLAMA_API bool llama_model_dspark_get_meta(
+        const struct llama_model * model,
+              llama_dspark_meta   * out);
+// Only the "vanilla" markov head (a plain low-rank embedding + linear pair,
+// VanillaMarkov in the Python reference implementation) is supported here: it's the only
+// variant present in shipped GGUFs today -- gated/rnn markov heads carry
+// extra gate_proj/joint_proj tensors that dspark's GGUF converter and
+// load_arch_tensors() don't currently map (see src/models/dspark.cpp).
+//
+// w1 and w2 are both returned as [n_vocab * n_rank] row-major (rank
+// fastest-varying), matching their GGUF storage (ne = [n_rank, n_vocab]):
+//   w1[token_id * n_rank + r] == markov_w1.weight[token_id][r]  (embedding row)
+//   w2[token_id * n_rank + r] == markov_w2.weight[token_id][r]  (mul_mat weight row)
+// Returns false (leaving w1/w2 untouched) if the model has no markov head.
+LLAMA_API bool llama_model_dspark_get_markov(
+        const struct llama_model * model,
+        std::vector<float>       & w1,
+        std::vector<float>       & w2);
+
+// Run the sequential vanilla Markov resample on the drafter backend. The
+// latest decode graph's logits remain device-resident; this helper gathers the
+// previous-token row from markov_head_a, multiplies by markov_head_b, adds the
+// corresponding logits row, and returns one argmax per block position. Returns
+// false when the head/backend is unsupported so callers can use the host path.
+LLAMA_API bool llama_dspark_markov_resample(
+        struct llama_context * ctx,
+        int32_t               n_rows,
+        llama_token           prev_token,
+        llama_token         * result);
+
+// dspark drafter: target-tap context window staging
+//
+// The dspark speculative-decoding drafter (EAGLE-style, block-diffusion) attends
+// to a small, growing window of the TARGET model's captured multi-layer tap
+// features (see llama_set_capture_layers above) as well as its own draft-block
+// tokens. The context window doesn't fit llama_batch.token/embd: it has a
+// different width (n_embd_cap = n_capture_layers * n_embd, i.e. RAW pre-fc tap
+// concatenation) and a different row count than the draft block, so it is
+// staged out of band, consumed by the drafter's graph on its next decode() call.
+//
+// feat is [n_ctx_rows * n_embd_cap] row-major (row i is the concatenated
+// multi-layer tap feature for the i-th staged context row). The decode position
+// of each context row is taken from the batch the drafter decodes next, not from
+// this staged data, so no positions are passed here. Pass n_ctx_rows <= 0 or
+// feat == nullptr to clear the staged context.
+LLAMA_API void llama_set_dspark_ctx(
+        struct llama_context * ctx,
+        const float           * feat,
+              int64_t           n_ctx_rows,
+              int64_t           n_embd_cap);

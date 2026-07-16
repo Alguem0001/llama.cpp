@@ -603,6 +603,18 @@ struct llama_model {
     std::vector<int32_t> target_layer_ids;
 
     std::vector<llama_layer> layers;
+    // dspark drafter extras
+    struct ggml_tensor * dspark_fc                 = nullptr;
+    struct ggml_tensor * dspark_hidden_norm        = nullptr;
+    struct ggml_tensor * dspark_markov_head_a      = nullptr;
+    struct ggml_tensor * dspark_markov_head_b      = nullptr;
+    struct ggml_tensor * dspark_confidence_head    = nullptr;
+    struct ggml_tensor * dspark_confidence_head_b  = nullptr;
+    struct ggml_tensor * dspark_log_snr_fc1_w      = nullptr;
+    struct ggml_tensor * dspark_log_snr_fc1_b      = nullptr;
+    struct ggml_tensor * dspark_log_snr_fc2_w      = nullptr;
+    struct ggml_tensor * dspark_log_snr_fc2_b      = nullptr;
+
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see

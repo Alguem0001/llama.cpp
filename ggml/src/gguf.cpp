@@ -752,6 +752,63 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
     }
     GGML_ASSERT(int64_t(ctx->info.size()) == n_tensors);
 
+    // Auto-detect PrismML legacy Q2_0 group-128 packing (same type id 42 as upstream g64).
+    // If sequential offsets only match with PQ2_0 (group-128) sizes, remap those tensors.
+    {
+        auto nbytes_as = [](const ggml_tensor & t_in, enum ggml_type type) -> size_t {
+            ggml_tensor t = t_in;
+            t.type = type;
+            const int64_t blck = ggml_blck_size(type);
+            if (blck == 0 || t.ne[0] % blck != 0) {
+                return (size_t) -1;
+            }
+            t.nb[0] = ggml_type_size(type);
+            t.nb[1] = t.nb[0] * (t.ne[0] / blck);
+            for (int j = 2; j < GGML_MAX_DIMS; ++j) {
+                t.nb[j] = t.nb[j - 1] * t.ne[j - 1];
+            }
+            return ggml_nbytes(&t);
+        };
+
+        auto offsets_ok = [&](bool use_pq2) -> bool {
+            size_t expect = 0;
+            for (size_t i = 0; i < ctx->info.size(); ++i) {
+                const gguf_tensor_info & ti = ctx->info[i];
+                if (ti.offset != expect) {
+                    return false;
+                }
+                enum ggml_type type = ti.t.type;
+                if (use_pq2 && type == GGML_TYPE_Q2_0) {
+                    type = GGML_TYPE_PQ2_0;
+                }
+                const size_t nb = nbytes_as(ti.t, type);
+                if (nb == (size_t) -1) {
+                    return false;
+                }
+                expect += GGML_PAD(nb, ctx->alignment);
+            }
+            return true;
+        };
+
+        if (!offsets_ok(false) && offsets_ok(true)) {
+            GGML_LOG_INFO("%s: remapping Q2_0 tensors to PQ2_0 (PrismML group-128 packing)\n", __func__);
+            for (size_t i = 0; i < ctx->info.size(); ++i) {
+                gguf_tensor_info & ti = ctx->info[i];
+                if (ti.t.type != GGML_TYPE_Q2_0) {
+                    continue;
+                }
+                ti.t.type = GGML_TYPE_PQ2_0;
+                const int64_t blck_size = ggml_blck_size(ti.t.type);
+                const size_t  type_size = ggml_type_size(ti.t.type);
+                ti.t.nb[0] = type_size;
+                ti.t.nb[1] = ti.t.nb[0] * (ti.t.ne[0] / blck_size);
+                for (int j = 2; j < GGML_MAX_DIMS; ++j) {
+                    ti.t.nb[j] = ti.t.nb[j - 1] * ti.t.ne[j - 1];
+                }
+            }
+        }
+    }
+
     // we require the data section to be aligned, so take into account any padding
     if (n_tensors > 0 && !gr.seek(GGML_PAD(gr.tell(), ctx->alignment))) {
         GGML_LOG_ERROR("%s: failed to seek to beginning of data section\n", __func__);

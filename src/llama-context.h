@@ -55,6 +55,9 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
+    void set_dspark_ctx(const float * feat, int64_t n_ctx_rows, int64_t n_embd_cap);
+    bool dspark_markov_resample(uint32_t n_rows, llama_token prev_token, llama_token * result);
+
     void synchronize();
 
     const llama_model   & get_model()   const;
@@ -392,3 +395,4 @@ private:
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
 };
+

@@ -4374,6 +4374,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
+    
+    add_opt(common_arg(
+        {"--kv-mean-center"}, "FNAME",
+        "path to K-cache mean-centering bias GGUF (Q4_0 K cache; see docs/kv-mean-center.md)",
+        [](common_params & params, const std::string & value) {
+            params.kv_mean_center_path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_EMBEDDING}));
+
     return ctx_arg;
 }
 

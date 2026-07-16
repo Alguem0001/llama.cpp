@@ -178,6 +178,10 @@ public:
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
 
+    // Optional per-channel K-cache mean-centering for Q4_0 (PrismML). See docs/kv-mean-center.md.
+    // require_q4_0=false is for tests against unquantized K caches.
+    bool load_kv_mean_center(const char * path, bool require_q4_0 = true);
+
     //
     // preparation API
     //
@@ -286,6 +290,11 @@ private:
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+
+    // K-cache mean-centering bias (see load_kv_mean_center())
+    std::vector<ggml_tensor *> k_bar;
+    std::vector<ggml_context_ptr> k_bar_ctxs;
+    std::vector<ggml_backend_buffer_ptr> k_bar_bufs;
 
     size_t total_size() const;
 

@@ -1,50 +1,70 @@
 # PrismML / Bonsai support (on master)
 
-This fork keeps **latest `ggml-org/llama.cpp` master** and ports the PrismML pieces
-needed to run Ternary-Bonsai models **without** resetting onto the older `prism` branch.
+This fork keeps **latest ggml-org/llama.cpp master** and ports PrismML runtime pieces needed
+for Bonsai / Ternary-Bonsai without resetting onto the older prism branch.
 
-## What is already upstream (master)
+## Features ported
 
-| Backend | Q1_0 (1-bit) | Q2_0 ternary (group-64) |
-|---------|--------------|-------------------------|
-| CPU     | yes          | yes (ARM NEON + generic) |
-| Metal   | yes          | yes |
-| CUDA    | yes          | **ported here** (from [ggml-org#25707](https://github.com/ggml-org/llama.cpp/pull/25707)) |
-| Vulkan  | yes          | **ported here** (from [ggml-org#25430](https://github.com/ggml-org/llama.cpp/pull/25430)) |
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Q1_0 | upstream | 1-bit Bonsai |
+| Q2_0 group-64 | upstream + CUDA/Vulkan/AVX-VNNI ports | use *_Q2_0_g64.gguf |
+| **PQ2_0 group-128** | **ported** | PrismML demo packing; auto-remap when GGUF offsets match g128 |
+| CUDA Q2_0/PQ2_0 | ported | MMQ/MMVQ kernels |
+| Vulkan Q2_0 | ported | |
+| Metal Q2_0 | upstream (g64) | |
+| **Hopper wgmma** | **ported (opt-in)** | -DGGML_CUDA_HOPPER_Q1=ON -DGGML_CUDA_CUTLASS_DIR=... + env GGML_HOPPER_Q1; Q1_0 + PQ2_0 |
+| **KV mean-centering** | **ported** | --kv-mean-center FNAME with Q4_0 K cache; see docs/kv-mean-center.md |
+| **DSpark speculative** | **ported** | arch/model/graph + draft-dspark speculative type; see docs/dspark-scope.md |
 
-Extra on this fork:
+## GGUF files
 
-- **x86 AVX-VNNI / AVX-512-VNNI** fast path for Q2_0 (adapted from PrismML for **group-64**)
+### Ternary (recommended official)
 
-## GGUF files to use
+`	ext
+*_Q2_0_g64.gguf   -> GGML_TYPE_Q2_0 (group 64)
+`
 
-Official master layout is **group size 64** (`QK2_0 = 64`).
+### Ternary (legacy Prism demo)
 
-Use Hugging Face files named `*_Q2_0_g64.gguf` (or the renamed plain `Q2_0` once PrismML migrates):
+`	ext
+*-Q2_0.gguf       -> auto-detected as GGML_TYPE_PQ2_0 (group 128)
+`
 
-```text
-hf download prism-ml/Ternary-Bonsai-8B-gguf  Ternary-Bonsai-8B-Q2_0_g64.gguf  --local-dir models
-hf download prism-ml/Ternary-Bonsai-27B-gguf Ternary-Bonsai-27B-Q2_0_g64.gguf --local-dir models
-```
+Detection: if sequential tensor offsets only match group-128 sizes, the loader remaps
+type id 42 (Q2_0) to PQ2_0.
 
-**Do not** use the older demo files `*-Q2_0.gguf` with **group-128** packing from the PrismML
-fork — those need the `prism` branch / prebuilt PrismML binaries (same type id, different block size).
+### 1-bit
 
-1-bit Bonsai (`Q1_0`) works on stock master backends.
+`	ext
+*-Q1_0.gguf
+`
 
-## Not ported (intentionally)
+## Hopper (optional)
 
-These remain only on [PrismML-Eng/llama.cpp `prism`](https://github.com/PrismML-Eng/llama.cpp/tree/prism)
-because they are large or tightly coupled to that tree:
-
-- CUDA Hopper wgmma optional path
-- DSpark speculative drafter
-- KV mean-centering tooling
-- Q2_0 **group-128** type layout
-
-## Build
-
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release   # add -DGGML_CUDA=ON / -DGGML_VULKAN=ON as needed
+`ash
+cmake -B build -DGGML_CUDA=ON -DGGML_CUDA_HOPPER_Q1=ON -DGGML_CUDA_CUTLASS_DIR=/path/to/cutlass
 cmake --build build -j
-```
+export GGML_HOPPER_Q1=1   # runtime enable
+`
+
+Requires sm_90a (Hopper). Falls through to stock MMQ when unsupported.
+
+## KV mean-centering
+
+`ash
+# calibrate
+./llama-kv-mean-center -m model.gguf -f calib.txt -o bias.gguf -ctk q4_0
+# run
+./llama-cli -m model.gguf -ctk q4_0 --kv-mean-center bias.gguf
+`
+
+## DSpark
+
+Use draft type draft-dspark with a DSpark GGUF drafter and multi-layer capture on the target.
+See docs/dspark-scope.md.
+
+## Branch notes
+
+- master — this integration (latest upstream + ports)
+- prism — full PrismML-Eng tree snapshot (older base)

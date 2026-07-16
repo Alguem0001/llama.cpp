@@ -1,4 +1,9 @@
 #include "llama-context.h"
+#include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
+
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -365,6 +370,30 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        if (params.path_kv_mean_center != nullptr) {
+            std::vector<llama_kv_cache *> kvs;
+            if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
+                kvs.push_back(kv);
+            } else if (auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get())) {
+                kvs.push_back(kv_iswa->get_base());
+                kvs.push_back(kv_iswa->get_swa());
+            } else if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+                kvs.push_back(hyb->get_mem_attn());
+            } else if (auto * hyb_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(memory.get())) {
+                kvs.push_back(hyb_iswa->get_mem_attn()->get_base());
+                kvs.push_back(hyb_iswa->get_mem_attn()->get_swa());
+            }
+            if (kvs.empty()) {
+                throw std::runtime_error("path_kv_mean_center is only supported for standard KV caches "
+                        "(not recurrent-only or MLA/DSA memory types)");
+            }
+            for (auto * kv : kvs) {
+                if (!kv->load_kv_mean_center(params.path_kv_mean_center)) {
+                    throw std::runtime_error("failed to load K-cache mean-centering bias file");
+                }
+            }
+        }
     }
 
     // init backends
@@ -3457,6 +3486,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.path_kv_mean_center         =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -3531,6 +3561,13 @@ llama_context * llama_init_from_model(
 
     if (ggml_is_quantized(params.type_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
         LLAMA_LOG_ERROR("%s: V cache quantization requires flash_attn\n", __func__);
+        return nullptr;
+    }
+
+
+    if (params.path_kv_mean_center != nullptr && params.type_k != GGML_TYPE_Q4_0) {
+        LLAMA_LOG_ERROR("%s: path_kv_mean_center requires the K cache type to be Q4_0 (got %s)\n",
+                __func__, ggml_type_name(params.type_k));
         return nullptr;
     }
 
@@ -4123,4 +4160,193 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+void llama_context::set_dspark_ctx(
+        const float   * feat,
+              int64_t   n_ctx_rows,
+              int64_t   n_embd_cap) {
+    if (n_ctx_rows <= 0 || n_embd_cap <= 0 || feat == nullptr) {
+        // reset: no staged context (e.g. before the very first drafter round,
+        // where the whole prompt still needs to go through as context on the
+        // first call, or between unrelated decodes).
+        dspark_ctx.n_ctx_rows = 0;
+        dspark_ctx.n_embd_cap = 0;
+        dspark_ctx.v_ctx_feat.clear();
+        return;
+    }
+
+    dspark_ctx.n_ctx_rows = n_ctx_rows;
+    dspark_ctx.n_embd_cap = n_embd_cap;
+
+    dspark_ctx.v_ctx_feat.assign(feat, feat + (size_t) n_ctx_rows * (size_t) n_embd_cap);
+}
+
+bool llama_context::dspark_markov_resample(
+        uint32_t     n_rows,
+        llama_token  prev_token,
+        llama_token * result) {
+    if (n_rows == 0 || result == nullptr || getenv("DSPARK_MARKOV_CPU") != nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * head_a = model.dspark_markov_head_a;
+    const ggml_tensor * head_b = model.dspark_markov_head_b;
+    if (head_a == nullptr || head_b == nullptr || gf_res_prev == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * t_logits = gf_res_prev->get_logits();
+    const int64_t n_vocab = model.vocab.n_tokens();
+    if (t_logits == nullptr || t_logits->type != GGML_TYPE_F32 || t_logits->data == nullptr ||
+            t_logits->ne[0] != n_vocab || t_logits->ne[1] < (int64_t) n_rows ||
+            head_a->ne[0] != head_b->ne[0] || head_a->ne[1] != head_b->ne[1] ||
+            head_a->ne[1] != n_vocab) {
+        return false;
+    }
+
+    const auto supported_head_type = [](ggml_type type) {
+        return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 ||
+               type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q8_0;
+    };
+    if (!supported_head_type(head_a->type) || !supported_head_type(head_b->type)) {
+        return false;
+    }
+
+    const ggml_backend_dev_t dev = model.dev_output();
+    if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return false;
+    }
+
+    if (!dspark_markov_sched) {
+        if (backend_ptrs.empty() || backend_buft.size() != backend_ptrs.size()) {
+            return false;
+        }
+
+        dspark_markov_sched.reset(ggml_backend_sched_new(
+                backend_ptrs.data(), backend_buft.data(), (int) backend_ptrs.size(),
+                /* graph_size = */ 64, /* parallel = */ false, cparams.op_offload));
+        if (!dspark_markov_sched) {
+            return false;
+        }
+    }
+
+    // The decode graph is asynchronous. Synchronize it once before the
+    // dedicated scheduler reads its logits output tensor.
+    synchronize();
+
+    // Build one graph covering rows [k0, k0 + n_chain). Each step consumes the
+    // previous step's GPU argmax tensor as the row id for head_a, so the
+    // sequential Markov dependency remains exact while Metal executes the
+    // whole chain in one scheduler submission.
+    const auto resample_chain = [&](uint32_t k0, uint32_t n_chain, llama_token tok0) -> bool {
+        ggml_init_params params = {
+            /*.mem_size   =*/ 128*ggml_tensor_overhead() + ggml_graph_overhead_custom(64, false),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx { ggml_init(params) };
+        if (!ctx) {
+            return false;
+        }
+
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
+        ggml_set_input(ids);
+
+        // Do not use ggml_view_1d on t_logits: its parent edge would recursively
+        // pull the completed decode graph into this tiny graph. Each base tensor
+        // is a detached, read-only alias of one already-computed logits row.
+        std::vector<ggml_tensor *> sampled_rows;
+        sampled_rows.reserve(n_chain);
+
+        ggml_tensor * prev_ids = ids;
+        for (uint32_t k = k0; k < k0 + n_chain; ++k) {
+            ggml_tensor * base = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n_vocab);
+            base->buffer = t_logits->buffer;
+            base->data = (char *) t_logits->data + (size_t) k * (size_t) n_vocab * sizeof(float);
+
+            ggml_tensor * emb = ggml_get_rows(ctx.get(), const_cast<ggml_tensor *>(head_a), prev_ids);
+            ggml_tensor * bias = ggml_mul_mat(ctx.get(), const_cast<ggml_tensor *>(head_b), emb);
+            ggml_tensor * logits = ggml_add(ctx.get(), base, bias);
+            ggml_tensor * sampled = ggml_argmax(ctx.get(), logits);
+
+            ggml_set_output(sampled);
+            sampled_rows.push_back(sampled);
+            prev_ids = sampled;
+        }
+
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), 64, false);
+        ggml_build_forward_expand(gf, sampled_rows.back());
+
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            if (!ggml_backend_dev_supports_op(dev, ggml_graph_node(gf, i))) {
+                return false;
+            }
+        }
+
+        ggml_backend_sched_reset(dspark_markov_sched.get());
+        if (!ggml_backend_sched_alloc_graph(dspark_markov_sched.get(), gf)) {
+            return false;
+        }
+
+        ggml_backend_t ids_backend = ggml_backend_sched_get_tensor_backend(dspark_markov_sched.get(), ids);
+        ggml_backend_t out_backend = ggml_backend_sched_get_tensor_backend(dspark_markov_sched.get(), sampled_rows.back());
+        if (ids_backend == nullptr || out_backend == nullptr ||
+                ggml_backend_get_device(out_backend) != dev) {
+            return false;
+        }
+
+        const int32_t id = (int32_t) tok0;
+        ggml_backend_tensor_set(ids, &id, 0, sizeof(id));
+
+        const ggml_status status = ggml_backend_sched_graph_compute(dspark_markov_sched.get(), gf);
+        if (status != GGML_STATUS_SUCCESS) {
+            return false;
+        }
+
+        // One scheduler synchronization covers the entire sequential chain.
+        for (uint32_t k = 0; k < n_chain; ++k) {
+            int32_t sampled_id = -1;
+            ggml_backend_tensor_get(sampled_rows[k], &sampled_id, 0, sizeof(sampled_id));
+            if (sampled_id < 0 || sampled_id >= n_vocab) {
+                return false;
+            }
+
+            result[k0 + k] = (llama_token) sampled_id;
+        }
+
+        return true;
+    };
+
+    // A/B toggle: emulate the pre-fusion behavior — one graph build, scheduler
+    // submission, synchronization, and host readback per draft step, with the
+    // sampled token fed back through the host between steps.
+    if (getenv("DSPARK_MARKOV_PER_STEP") != nullptr) {
+        llama_token tok = prev_token;
+        for (uint32_t k = 0; k < n_rows; ++k) {
+            if (!resample_chain(k, 1, tok)) {
+                return false;
+            }
+            tok = result[k];
+        }
+        return true;
+    }
+
+    return resample_chain(0, n_rows, prev_token);
+}
+
+void llama_set_dspark_ctx(
+        llama_context * ctx,
+        const float   * feat,
+              int64_t   n_ctx_rows,
+              int64_t   n_embd_cap) {
+    ctx->set_dspark_ctx(feat, n_ctx_rows, n_embd_cap);
+}
+
+bool llama_dspark_markov_resample(
+        struct llama_context * ctx,
+        int32_t               n_rows,
+        llama_token           prev_token,
+        llama_token         * result) {
+    return ctx != nullptr && ctx->dspark_markov_resample((uint32_t) n_rows, prev_token, result);
 }

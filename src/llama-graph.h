@@ -85,6 +85,42 @@ struct llama_cross {
     std::vector<std::set<llama_seq_id>> seq_ids_enc;
 };
 
+struct llama_dspark_ctx {
+    int64_t n_embd_cap = 0; // n_capture_layers * n_embd (raw tap width, pre dspark.fc)
+    int64_t n_ctx_rows = 0; // number of staged context rows for the next decode call
+
+    // [n_ctx_rows * n_embd_cap], row-major: row i is the concatenated multi-layer
+    // tap feature for the i-th staged context row (e.g. from
+    // llama_get_embeddings_capture_ith on the target's context, one row per
+    // accepted-since-last-round token). Row positions come from the decode batch,
+    // not from this staged data.
+    std::vector<float>   v_ctx_feat;
+};
+
+class llm_graph_input_dspark_ctx : public llm_graph_input_i {
+public:
+    llm_graph_input_dspark_ctx(const llama_dspark_ctx * dctx) : dctx(dctx) {}
+    virtual ~llm_graph_input_dspark_ctx() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * ctx_feat = nullptr; // F32 [n_embd_cap, n_ctx_rows]
+
+    const llama_dspark_ctx * dctx;
+};
+
+class llm_graph_input_dspark_logsnr : public llm_graph_input_i {
+public:
+    llm_graph_input_dspark_logsnr(std::vector<float> feat) : v_feat(std::move(feat)) {}
+    virtual ~llm_graph_input_dspark_logsnr() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * feat = nullptr; // F32 [n_freq, n_draft]
+
+    std::vector<float> v_feat;
+};
+
 struct llm_graph_params;
 
 //
