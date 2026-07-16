@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cinttypes>
 #include <cstring>
 #include <limits>
 #include <map>

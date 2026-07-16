@@ -1,5 +1,8 @@
 #pragma once
 
+#include <vector>
+
+
 // this is a staging header for new llama.cpp API
 // breaking changes and C++ are allowed. everything here should be considered WIP
 // try as much as possible to not include this header in the rest of the codebase

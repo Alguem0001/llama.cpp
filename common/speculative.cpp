@@ -1,6 +1,6 @@
 #include "speculative.h"
 #include "dspark-markov.h"
-#include "llama-ext.h"
+#include "../src/llama-ext.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -2356,7 +2356,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_ngram_mod     = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MOD));
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 10);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 11);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -2414,7 +2414,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
         case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK: {
-            return std::make_unique<common_speculative_impl_draft_dspark>(params, n_seq);
+            // DSpark impl requires multi-layer capture APIs not fully wired on this master port yet
+            throw std::runtime_error("draft-dspark not fully enabled in this build; use draft-simple or ngram");
         } break;
 
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {
@@ -2736,6 +2737,8 @@ void common_speculative_print_stats(const common_speculative * spec) {
 }
 
 
+
+#if 0 // Prism DSpark speculative impl (partial port; disabled for build stability)
 // dspark: EAGLE-style block-diffusion drafter (Phase 2 of the dspark port --
 // see docs/dspark-scope.md). The forward graph itself
 // (src/models/dspark.cpp) is Phase 1 and is not touched here; this class only
@@ -3391,3 +3394,17 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         return true;
     }
 };
+#endif // DSpark speculative
+
+
+bool common_speculative_dspark_stage_ctx_test(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        const float * feat,
+        int64_t n_rows,
+        int64_t n_embd_cap,
+        const int32_t * pos) {
+    GGML_UNUSED(spec); GGML_UNUSED(seq_id); GGML_UNUSED(feat);
+    GGML_UNUSED(n_rows); GGML_UNUSED(n_embd_cap); GGML_UNUSED(pos);
+    return false;
+}

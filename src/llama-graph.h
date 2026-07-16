@@ -97,30 +97,6 @@ struct llama_dspark_ctx {
     std::vector<float>   v_ctx_feat;
 };
 
-class llm_graph_input_dspark_ctx : public llm_graph_input_i {
-public:
-    llm_graph_input_dspark_ctx(const llama_dspark_ctx * dctx) : dctx(dctx) {}
-    virtual ~llm_graph_input_dspark_ctx() = default;
-
-    void set_input(const llama_ubatch * ubatch) override;
-
-    ggml_tensor * ctx_feat = nullptr; // F32 [n_embd_cap, n_ctx_rows]
-
-    const llama_dspark_ctx * dctx;
-};
-
-class llm_graph_input_dspark_logsnr : public llm_graph_input_i {
-public:
-    llm_graph_input_dspark_logsnr(std::vector<float> feat) : v_feat(std::move(feat)) {}
-    virtual ~llm_graph_input_dspark_logsnr() = default;
-
-    void set_input(const llama_ubatch * ubatch) override;
-
-    ggml_tensor * feat = nullptr; // F32 [n_freq, n_draft]
-
-    std::vector<float> v_feat;
-};
-
 struct llm_graph_params;
 
 //
@@ -150,6 +126,31 @@ protected:
     // env: LLAMA_GRAPH_INPUT_DEBUG
     int debug = 0;
 };
+
+class llm_graph_input_dspark_ctx : public llm_graph_input_i {
+public:
+    llm_graph_input_dspark_ctx(const llama_dspark_ctx * dctx) : dctx(dctx) {}
+    virtual ~llm_graph_input_dspark_ctx() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * ctx_feat = nullptr; // F32 [n_embd_cap, n_ctx_rows]
+
+    const llama_dspark_ctx * dctx;
+};
+
+class llm_graph_input_dspark_logsnr : public llm_graph_input_i {
+public:
+    llm_graph_input_dspark_logsnr(std::vector<float> feat) : v_feat(std::move(feat)) {}
+    virtual ~llm_graph_input_dspark_logsnr() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * feat = nullptr; // F32 [n_freq, n_draft]
+
+    std::vector<float> v_feat;
+};
+
 
 using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
 
@@ -720,6 +721,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_dspark_ctx       * dspark_ctx = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -960,6 +962,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_dspark_ctx       * dspark_ctx;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

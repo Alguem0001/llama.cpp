@@ -289,6 +289,9 @@ private:
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
+    llama_dspark_ctx dspark_ctx;
+    ggml_backend_sched_ptr dspark_markov_sched;
+
     llama_memory_ptr memory;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])

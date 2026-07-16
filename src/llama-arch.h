@@ -623,6 +623,14 @@ enum llm_tensor {
     LLM_TENSOR_MASKED_EMBD_ORDERING,
     LLM_TENSOR_FC,
     LLM_TENSOR_D2T,
+    // PrismML DSpark drafter extras
+    LLM_TENSOR_DSPARK_FC,
+    LLM_TENSOR_DSPARK_HIDDEN_NORM,
+    LLM_TENSOR_DSPARK_MARKOV_HEAD_A,
+    LLM_TENSOR_DSPARK_MARKOV_HEAD_B,
+    LLM_TENSOR_DSPARK_CONFIDENCE_HEAD,
+    LLM_TENSOR_DSPARK_LOG_SNR_FC1,
+    LLM_TENSOR_DSPARK_LOG_SNR_FC2,
 };
 
 
@@ -630,14 +638,6 @@ enum llm_tensor_layer {
     LLM_TENSOR_LAYER_INPUT,
     LLM_TENSOR_LAYER_REPEATING,
     LLM_TENSOR_LAYER_OUTPUT,
-    LLM_TENSOR_DSPARK_FC,              // [n_capture * target_hidden, hidden] feature projection
-    LLM_TENSOR_DSPARK_HIDDEN_NORM,    // RMSNorm after fc
-    LLM_TENSOR_DSPARK_MARKOV_HEAD_A,  // low-rank logit-bias factor A
-    LLM_TENSOR_DSPARK_MARKOV_HEAD_B,  // low-rank logit-bias factor B
-    LLM_TENSOR_DSPARK_CONFIDENCE_HEAD, // accept-rate predictor
-    LLM_TENSOR_DSPARK_LOG_SNR_FC1,     // GIDD log-SNR embed: [n_freq -> hidden]
-    LLM_TENSOR_DSPARK_LOG_SNR_FC2,     // GIDD log-SNR embed: [hidden -> hidden]
-
 };
 
 struct LLM_KV {
