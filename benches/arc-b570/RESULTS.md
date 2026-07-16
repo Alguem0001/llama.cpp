@@ -36,6 +36,20 @@ Device caps reported: `fp16:1 int_dot:1 matrix cores: KHR_coopmat · warp 32 · 
 
 On the **real Bonsai-27B Q1_0** workload, FA path choice is **neutral** (bandwidth-bound decode). Prefer keeping Xe2 default; use Legacy only if you measure PP regression on your prompts.
 
+## SYCL vs Vulkan — Bonsai-27B Q1_0 (2 reps)
+
+| Backend | pp512 t/s | tg128 t/s |
+|---------|----------:|----------:|
+| **Vulkan** (build-arc) | **~475** | **~36.6** |
+| SYCL / Level Zero (build-sycl) | ~416 | ~15.9 |
+
+**Winner on Arc B570 Windows for Bonsai Q1_0: Vulkan** (~2.3× TG, ~1.14× PP).
+
+Notes:
+- SYCL **does not support Q2_0** (`unsupport data type=q2_0`) — 1.7B Ternary cannot run on this SYCL build.
+- SYCL needs `setvars.bat` + `ONEAPI_DEVICE_SELECTOR=level_zero:gpu` at runtime.
+- Keep daily path on **Vulkan** (`build\bin` synced from `build-arc`).
+
 ## Env knobs (this fork)
 
 | Variable | Effect |
