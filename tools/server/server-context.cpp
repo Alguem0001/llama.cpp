@@ -1241,12 +1241,21 @@ private:
                 if (spec_dspark && has_draft) {
                     const uint32_t block_size = server_read_dspark_block_size(params_base.speculative.draft.mparams.path);
                     const uint32_t bs = block_size > 0 ? block_size : 7;
-                    // One llama_decode over (ctx_len + block_size) with NON-causal attention.
-                    // llama-context asserts: !causal_attn => n_ubatch >= n_tokens_all.
-                    // Chunking ubatch is illegal here — must match n_batch headroom.
-                    const uint32_t n_batch_dspark = (uint32_t) params_dft.n_ctx + bs;
+                    // Draft streams long context into KV in chunks (DSPARK_CTX_CHUNK,
+                    // default 256), then packs remaining+block. n_batch only needs
+                    // headroom for one chunk + block — not full n_ctx + block.
+                    // Non-causal still requires n_ubatch >= n_tokens per call.
+                    uint32_t ctx_chunk = 256;
+                    if (const char * e = getenv("DSPARK_CTX_CHUNK")) {
+                        const int v = atoi(e);
+                        if (v >= 32) {
+                            ctx_chunk = (uint32_t) v;
+                        }
+                    }
+                    const uint32_t n_batch_dspark = ctx_chunk + bs;
                     if ((uint32_t) params_dft.n_batch < n_batch_dspark) {
-                        SRV_INF("draft-dspark: raising draft n_batch %d -> %u\n", params_dft.n_batch, n_batch_dspark);
+                        SRV_INF("draft-dspark: raising draft n_batch %d -> %u (chunk=%u + block=%u)\n",
+                                params_dft.n_batch, n_batch_dspark, ctx_chunk, bs);
                         params_dft.n_batch = (int32_t) n_batch_dspark;
                     }
                     if ((uint32_t) params_dft.n_ubatch < (uint32_t) params_dft.n_batch) {
@@ -1258,7 +1267,6 @@ private:
                     if ((uint32_t) params_dft.n_outputs_max < n_out) {
                         params_dft.n_outputs_max = (int32_t) n_out;
                     }
-                    // n_max must equal block_size for this drafter
                     if (params_base.speculative.draft.n_max != (int32_t) bs) {
                         SRV_INF("draft-dspark: setting n_max to block_size=%u (was %d)\n",
                                 bs, params_base.speculative.draft.n_max);

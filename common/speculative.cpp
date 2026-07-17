@@ -3115,57 +3115,86 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
             GGML_ASSERT(pos.front() == (int32_t) L        && "dspark: staged rows do not start at the drafter's cache position");
             GGML_ASSERT(pos.back()  == (int32_t) start - 1 && "dspark: staged rows do not end just before the anchor position");
 
-            const int64_t n_tokens = ctx_len + block_size;
-            if (n_tokens > n_batch_max) {
-                LOG_ERR("%s: seq %d round needs %lld tokens > n_batch=%lld -- skipping\n",
-                        __func__, (int) seq_id, (long long) n_tokens, (long long) n_batch_max);
+            // Context rows only contribute K/V (Q is discarded — see dspark.cpp).
+            // K/V at position i depend only on that row's tap features, so long
+            // contexts can stream into the drafter KV in chunks. Final call packs
+            // remaining context + draft block. Huge win vs one (ctx_len+block)
+            // non-causal decode on Arc after a long prompt (NVIDIA hides this).
+            int64_t ctx_chunk = 256;
+            if (const char * e = getenv("DSPARK_CTX_CHUNK")) {
+                const int v = atoi(e);
+                if (v >= 32) {
+                    ctx_chunk = v;
+                }
+            }
+            ctx_chunk = std::min(ctx_chunk, std::max<int64_t>(32, n_batch_max - (int64_t) block_size));
+
+            int64_t processed = 0;
+            bool decode_ok = true;
+
+            // 1) Stream pure-context chunks into the drafter KV (no draft block).
+            while (ctx_len - processed > ctx_chunk) {
+                const int64_t n_chunk = ctx_chunk;
+                llama_set_dspark_ctx(ctx_dft,
+                        feat.data() + (size_t) processed * (size_t) n_embd_cap,
+                        n_chunk, n_embd_cap);
+                common_batch_clear(batch);
+                for (int64_t i = 0; i < n_chunk; ++i) {
+                    common_batch_add(batch, 0, (llama_pos)(L + processed + i), { seq_id }, false);
+                }
+                const int32_t rc = llama_decode(ctx_dft, batch);
+                llama_set_dspark_ctx(ctx_dft, nullptr, 0, 0);
+                if (rc != 0) {
+                    LOG_WRN("%s: llama_decode(ctx_dft) ctx-chunk failed rc=%d seq=%d off=%lld n=%lld\n",
+                            __func__, rc, (int) seq_id, (long long) processed, (long long) n_chunk);
+                    decode_ok = false;
+                    break;
+                }
+                processed += n_chunk;
+                n_cache[seq_id] = L + processed;
+            }
+
+            // 2) Final: remaining context rows + draft block (anchor + masks).
+            if (decode_ok) {
+                const int64_t remaining = ctx_len - processed;
+                if (remaining + (int64_t) block_size > n_batch_max) {
+                    LOG_ERR("%s: seq %d final pack remaining=%lld + block=%d > n_batch=%lld\n",
+                            __func__, (int) seq_id, (long long) remaining, block_size, (long long) n_batch_max);
+                    decode_ok = false;
+                } else {
+                    llama_set_dspark_ctx(ctx_dft,
+                            remaining > 0 ? feat.data() + (size_t) processed * (size_t) n_embd_cap : nullptr,
+                            remaining, n_embd_cap);
+                    common_batch_clear(batch);
+                    for (int64_t i = 0; i < remaining; ++i) {
+                        common_batch_add(batch, 0, (llama_pos)(L + processed + i), { seq_id }, false);
+                    }
+                    // block pos 0 = real anchor; 1..block_size-1 = mask
+                    common_batch_add(batch, dp.id_last, (llama_pos) start, { seq_id }, true);
+                    for (int32_t k = 1; k < block_size; ++k) {
+                        common_batch_add(batch, mask_token_id, (llama_pos)(start + k), { seq_id }, true);
+                    }
+                    const int32_t rc = llama_decode(ctx_dft, batch);
+                    llama_set_dspark_ctx(ctx_dft, nullptr, 0, 0);
+                    if (rc != 0) {
+                        LOG_WRN("%s: llama_decode(ctx_dft) final failed rc=%d for seq %d\n",
+                                __func__, rc, (int) seq_id);
+                        decode_ok = false;
+                    }
+                }
+            }
+
+            if (!decode_ok) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1);
+                n_cache[seq_id] = 0;
+                feat.clear();
+                pos.clear();
+                rows_since_accept[seq_id] = 0;
                 continue;
             }
 
-            llama_set_dspark_ctx(ctx_dft, feat.data(), ctx_len, n_embd_cap);
-
-            common_batch_clear(batch);
-            for (int64_t i = 0; i < ctx_len; ++i) {
-                // dummy token id: this row's real content comes from the
-                // staged dspark ctx feature above, not the token embedding
-                // (see src/models/dspark.cpp -- these columns are sliced away
-                // before the residual stream even forms). logits=false: this
-                // impl never reads output for context rows.
-                common_batch_add(batch, /* token = */ 0, (llama_pos)(L + i), { seq_id }, /* logits = */ false);
-            }
-            // block position 0 is seeded with the REAL last-accepted token
-            // (the "anchor"), NOT mask_token_id -- matches the Python reference
-            // reference's evaluator._propose (draft_input_ids[:,0] =
-            // output_ids[:,start]). Positions 1..block_size-1 are masked.
-            common_batch_add(batch, dp.id_last, (llama_pos) start, { seq_id }, /* logits = */ true);
-            for (int32_t k = 1; k < block_size; ++k) {
-                common_batch_add(batch, mask_token_id, (llama_pos)(start + k), { seq_id }, /* logits = */ true);
-            }
-
-            const int32_t rc = llama_decode(ctx_dft, batch);
-
-            // always clear the staged ctx immediately after use, success or not.
-            llama_set_dspark_ctx(ctx_dft, nullptr, 0, 0);
-
-            if (rc != 0) {
-                LOG_WRN("%s: llama_decode(ctx_dft) failed rc=%d for seq %d\n", __func__, rc, (int) seq_id);
-                continue;
-            }
-
-            // crop away the just-written draft block, keeping only the
-            // (now-committed) context rows -- mirrors
-            // past_key_values_draft.crop(start) in the Python reference implementation.
-            // The speculative tail is discarded every round regardless of
-            // what the target ultimately accepts; only accept()/process()
-            // decide what becomes real context for the NEXT round.
+            // crop away the just-written draft block, keeping only context rows
             if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, (llama_pos) start, -1)) {
-                // Could not crop just the speculative tail (e.g. the backend
-                // rejected the partial removal): the physical drafter cache still
-                // contains the draft rows, so advancing n_cache to `start` would
-                // desync bookkeeping from the cache and corrupt every later round.
-                // Recover deterministically by wiping the whole drafter sequence
-                // and resetting bookkeeping so the next round rebuilds its context
-                // from scratch (a full-sequence removal always succeeds).
                 LOG_ERR("%s: failed to crop drafter cache tail for seq %d at start=%lld -- "
                         "resetting the drafter sequence to recover\n",
                         __func__, (int) seq_id, (long long) start);
@@ -3180,7 +3209,7 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
 
             feat.clear();
             pos.clear();
-            rows_since_accept[seq_id] = 0; // this round's rows were just consumed
+            rows_since_accept[seq_id] = 0;
 
             // --- sequential Markov resample -------------------------------
             // step_logits[k] = base_logits[k] + markov_w2(markov_w1(prev_token)),
