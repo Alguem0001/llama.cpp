@@ -171,6 +171,15 @@ endif()
 
 target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
 
+# DSpark host Markov resample is O(n_vocab * rank) per draft position (~64M FLOPs
+# for Bonsai). Enable OpenMP so Windows/Vulkan builds don't fall back to a
+# single-threaded scalar path (CUDA markov is only built with GGML_CUDA).
+find_package(OpenMP)
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(${TARGET} PRIVATE OpenMP::OpenMP_CXX)
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_DSPARK_MARKOV_OPENMP=1)
+endif()
+
 # PrismML DSpark Markov CUDA resample (optional)
 if (GGML_CUDA)
     target_sources(llama-common PRIVATE dspark-markov.cu)

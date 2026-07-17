@@ -3314,6 +3314,36 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                         }
                     }
 #else
+                    // Host path: W2 is [n_vocab, rank]. Naive scalar GEMV is ~n_vocab*rank
+                    // FLOPs per position (for Bonsai: 248320*256 ≈ 64M mul-adds × block_size).
+                    // OpenMP over vocab is essential on non-CUDA Windows (no cublas/metal path).
+#if defined(LLAMA_DSPARK_MARKOV_OPENMP) || defined(_OPENMP)
+#pragma omp parallel
+                    {
+                        float       thr_best_v  = -std::numeric_limits<float>::infinity();
+                        llama_token thr_best_id = 0;
+#pragma omp for schedule(static) nowait
+                        for (int64_t v = 0; v < n_vocab; ++v) {
+                            const float * w2row = markov_w2.data() + (size_t) v * (size_t) markov_rank;
+                            float bias = 0.0f;
+                            for (int64_t r = 0; r < markov_rank; ++r) {
+                                bias += emb[r] * w2row[r];
+                            }
+                            const float logit = base_logits[v] + bias;
+                            if (logit > thr_best_v) {
+                                thr_best_v  = logit;
+                                thr_best_id = (llama_token) v;
+                            }
+                        }
+#pragma omp critical
+                        {
+                            if (thr_best_v > best_v) {
+                                best_v  = thr_best_v;
+                                best_id = thr_best_id;
+                            }
+                        }
+                    }
+#else
                     for (int64_t v = 0; v < n_vocab; ++v) {
                         const float * w2row = markov_w2.data() + (size_t) v * (size_t) markov_rank;
                         float bias = 0.0f;
@@ -3327,13 +3357,36 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
                         }
                     }
 #endif
+#endif
                 } else {
+#if defined(LLAMA_DSPARK_MARKOV_OPENMP) || defined(_OPENMP)
+#pragma omp parallel
+                    {
+                        float       thr_best_v  = -std::numeric_limits<float>::infinity();
+                        llama_token thr_best_id = 0;
+#pragma omp for schedule(static) nowait
+                        for (int64_t v = 0; v < n_vocab; ++v) {
+                            if (base_logits[v] > thr_best_v) {
+                                thr_best_v  = base_logits[v];
+                                thr_best_id = (llama_token) v;
+                            }
+                        }
+#pragma omp critical
+                        {
+                            if (thr_best_v > best_v) {
+                                best_v  = thr_best_v;
+                                best_id = thr_best_id;
+                            }
+                        }
+                    }
+#else
                     for (int64_t v = 0; v < n_vocab; ++v) {
                         if (base_logits[v] > best_v) {
                             best_v  = base_logits[v];
                             best_id = (llama_token) v;
                         }
                     }
+#endif
                 }
 
                 result.push_back(best_id);
