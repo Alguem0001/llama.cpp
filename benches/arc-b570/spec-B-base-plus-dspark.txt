@@ -1,0 +1,12 @@
+﻿
+
+llama-cli.exe : ggml_vulkan: B570 optimized kernel: ON (v2)  [toggle: GGML_VK_B570_KERNEL=0|1]
+No linha:25 caractere:6
++ $b = & .\llama-cli.exe -m $base -md $draft --spec-draft-n-max 16 --sp ...
++      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ggml_vulkan: B5...570_KERNEL=0|1]:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+C:\Users\geron\OneDrive\Desktop\AI\Bansai Llama.cpp\llama.cpp\ggml\src\ggml-cpu\ops.cpp:5068: fatal error
+Loading model... 
+

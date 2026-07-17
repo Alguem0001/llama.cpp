@@ -1,0 +1,54 @@
+﻿
+
+llama-cli.exe : ggml_vulkan: B570 optimized kernel: ON (v2)  [toggle: GGML_VK_B570_KERNEL=0|1]
+No linha:17 caractere:6
++ $a = & .\llama-cli.exe -m $base -ngl 99 -fa on -n 128 -c 4096 -p $pro ...
++      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ggml_vulkan: B5...570_KERNEL=0|1]:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Loading model... 
+
+ÔûäÔûä ÔûäÔûä
+ÔûêÔûê ÔûêÔûê
+ÔûêÔûê ÔûêÔûê  ÔûÇÔûÇÔûêÔûä ÔûêÔûêÔûêÔûäÔûêÔûêÔûêÔûä  ÔûÇÔûÇÔûêÔûä    ÔûäÔûêÔûêÔûêÔûê ÔûêÔûêÔûêÔûêÔûä ÔûêÔûêÔûêÔûêÔûä
+ÔûêÔûê ÔûêÔûê ÔûäÔûêÔûÇÔûêÔûê ÔûêÔûê ÔûêÔûê ÔûêÔûê ÔûäÔûêÔûÇÔûêÔûê    ÔûêÔûê    ÔûêÔûê ÔûêÔûê ÔûêÔûê ÔûêÔûê
+ÔûêÔûê ÔûêÔûê ÔûÇÔûêÔûäÔûêÔûê ÔûêÔûê ÔûêÔûê ÔûêÔûê ÔûÇÔûêÔûäÔûêÔûê ÔûêÔûê ÔûÇÔûêÔûêÔûêÔûê ÔûêÔûêÔûêÔûêÔûÇ ÔûêÔûêÔûêÔûêÔûÇ
+                                    ÔûêÔûê    ÔûêÔûê
+                                    ÔûÇÔûÇ    ÔûÇÔûÇ
+
+build      : b15-22c3be93d
+model      : C:\Users\geron\OneDrive\Desktop\AI\Bansai Llama.cpp\models\Bonsai-27B-Q1_0.gguf
+ftype      : Q1_0
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+
+> Write a short technical explanation of how GPUs accelerate neural network inference, with three concrete points.
+
+[Start thinking]
+
+Here's a thinking thinking sequence
+
+1.  **Deconstruct the user's request:**
+    *   Topic: How GPUs accelerate neural network inference.
+    *   Format: Short technical explanation.
+    *   Constraint: Three concrete points.
+
+2.  **Brainstorm core concepts (GPU vs. CPU for Neural Networks):**
+    *   What makes GPUs fast for NNs?
+    *   *Parallelism:* GPUs have many cores (thousands vs. dozens on CPUs). NNs involve massive matrix multiplications.
+    *   *Memory:* NNs are memory-bound sometimes, but often compute-bound
+
+[ Prompt: 49.5 t/s | Generation: 36.8 t/s ]
+
+
+Exiting...
+

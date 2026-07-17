@@ -1,7 +1,8 @@
 # Arc B570 — Kernel Custom: resumo do que foi feito
 
 **Data do registro:** 2026-07-17  
-**Objetivo:** acelerar **token generation (TG)** e **prompt processing (PP)** do Bonsai no Intel Arc B570 (Vulkan / Xe2), via perfil de kernels em `ggml-vulkan`, **sem** reescrever shaders GLSL do zero.
+**Objetivo:** acelerar **token generation (TG)** e **prompt processing (PP)** do Bonsai no Intel Arc B570 (Vulkan / Xe2), via perfil de kernels em `ggml-vulkan`.  
+**Padrão atual (Xe2/B570): kernel v4** — `GGML_VK_B570_KERNEL` default `3` (= v4: v3 + mmvq_vec Q1/Q2 + fuse rms_norm_mul). Modos 0/1/2 ficam só para A/B legado; **o path que continua é v4**.
 
 ---
 
@@ -11,10 +12,10 @@
 
 | O quê | Caminho |
 |--------|---------|
-| **Perfil B570 (v2/v3)** — flags, env, FA, warptile, mmvq | `llama.cpp\ggml\src\ggml-vulkan\ggml-vulkan.cpp` |
-| Struct device: `b570_mode`, `b570_kernel` | ~linha 748–752 (mesmo arquivo) |
-| Parse env `GGML_VK_B570_KERNEL` | `ggml_vk_b570_kernel_mode_from_env()` |
-| Init + log `ON (v2\|v3\|OFF)` | init do device Vulkan (~6777+) |
+| **Perfil B570 (v2/v3/v4)** — flags, env, FA, warptile, mmvq, fusões | `llama.cpp\ggml\src\ggml-vulkan\ggml-vulkan.cpp` |
+| Struct device: `b570_mode`, `b570_kernel`, flags v4 | ~linha 748–760 (mesmo arquivo) |
+| Parse env `GGML_VK_B570_KERNEL` (default Xe2 → **3/v4**) | `ggml_vk_b570_kernel_mode_from_env()` |
+| Init + log `ON (v4\|v3\|v2\|OFF)` | init do device Vulkan (~6777+) |
 | mmvq path principal (decode) | `ggml_vk_get_dequantize_mul_mat_vec*` |
 | mmvq path **id** (paridade v3) | `ggml_vk_get_dequantize_mul_mat_vec_id` |
 | Enum workgroup: SUBGROUP / LARGE / **XL** | `enum dmmv_wg_sizes` |

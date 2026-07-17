@@ -1,7 +1,8 @@
 # Arc B570 — Kernel v4: design + o que veio do b70-optimization-lab
 
-**Data:** 2026-07-17
-**Base:** tree local `llama.cpp` branch `arc-speed` (kernel v3 já no tree, default Xe2 = v3)
+**Data:** 2026-07-17  
+**Base:** branch `arc-speed` — **kernel v4 é o padrão em Intel Xe2/B570** (`GGML_VK_B570_KERNEL` default = `3`)  
+**Legado:** modos `0` (off), `1` (v2), `2` (v3) só via env para A/B; o path que segue em produção/dev é **apenas v4**.  
 **Fontes externas:** [steveseguin/b70-optimization-lab](https://github.com/steveseguin/b70-optimization-lab) (lab Intel XPU, 4× Arc Pro B70), estado do upstream `ggml-vulkan` (PR #14001 coopmat Xe2 etc.)
 
 ---
