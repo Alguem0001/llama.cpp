@@ -179,6 +179,17 @@ struct common_speculative_impl {
 
     // true if this implementation requires the target context to extract pre-norm embeddings
     virtual bool need_embd_nextn() const { return false; }
+
+    // true if this implementation requires multi-layer tap capture (dspark)
+    virtual bool need_embd_capture() const { return false; }
+
+    // test helper: inject staged capture features (dspark only)
+    virtual bool stage_test_ctx_feat(
+            llama_seq_id /*seq_id*/,
+            const float * /*feat*/,
+            int64_t /*n_rows*/,
+            int64_t /*n_embd_cap*/,
+            const int32_t * /*pos*/) { return false; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -2202,6 +2213,9 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+                // dspark real bound is checkpoint block_size; use draft.n_max
+                // (callers should set --spec-draft-n-max >= block_size)
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
@@ -2334,6 +2348,10 @@ common_speculative_init_result_ptr common_speculative_init_from_params(common_pa
     return std::make_unique<common_speculative_init_result>(params, model_tgt, ctx_tgt);
 }
 
+// Defined after common_speculative_impl_draft_dspark (complete type required for make_unique).
+static std::unique_ptr<common_speculative_impl> common_speculative_make_draft_dspark(
+        const common_params_speculative & params, uint32_t n_seq);
+
 // initialization of the speculative decoding system
 //
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
@@ -2346,8 +2364,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_draft_eagle3 = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3)) && params.draft.ctx_dft != nullptr;
         bool has_draft_mtp    = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP))    && params.draft.ctx_dft != nullptr;
         bool has_draft_dflash = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) && params.draft.ctx_dft != nullptr;
-
-
+        bool has_draft_dspark = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) && params.draft.ctx_dft != nullptr;
 
         bool has_ngram_cache   = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_CACHE));
         bool has_ngram_simple  = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE));
@@ -2389,6 +2406,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         if (has_draft_dflash) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params));
         }
+        if (has_draft_dspark) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params));
+        }
     }
 
     std::vector<std::unique_ptr<common_speculative_impl>> impls = {};
@@ -2413,10 +2433,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 impls.push_back(std::make_unique<common_speculative_impl_draft_dflash>(config.params, n_seq));
                 break;
             }
-        case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK: {
-            // DSpark impl requires multi-layer capture APIs not fully wired on this master port yet
-            throw std::runtime_error("draft-dspark not fully enabled in this build; use draft-simple or ngram");
-        } break;
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK: {
+                impls.push_back(common_speculative_make_draft_dspark(config.params, n_seq));
+                break;
+            }
 
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {
                 common_ngram_map ngram_map = get_common_ngram_map(config.type, config.params.ngram_simple);
@@ -2544,6 +2564,20 @@ bool common_speculative_need_embd_nextn(common_speculative * spec) {
 
     for (auto & impl : spec->impls) {
         if (impl->need_embd_nextn()) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool common_speculative_need_embd_capture(common_speculative * spec) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    for (auto & impl : spec->impls) {
+        if (impl->need_embd_capture()) {
             return true;
         }
     }
@@ -2738,7 +2772,7 @@ void common_speculative_print_stats(const common_speculative * spec) {
 
 
 
-#if 0 // Prism DSpark speculative impl (partial port; disabled for build stability)
+#if 1 // Prism DSpark speculative impl
 // dspark: EAGLE-style block-diffusion drafter (Phase 2 of the dspark port --
 // see docs/dspark-scope.md). The forward graph itself
 // (src/models/dspark.cpp) is Phase 1 and is not touched here; this class only
@@ -3394,6 +3428,11 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl {
         return true;
     }
 };
+
+static std::unique_ptr<common_speculative_impl> common_speculative_make_draft_dspark(
+        const common_params_speculative & params, uint32_t n_seq) {
+    return std::make_unique<common_speculative_impl_draft_dspark>(params, n_seq);
+}
 #endif // DSpark speculative
 
 
@@ -3404,7 +3443,16 @@ bool common_speculative_dspark_stage_ctx_test(
         int64_t n_rows,
         int64_t n_embd_cap,
         const int32_t * pos) {
-    GGML_UNUSED(spec); GGML_UNUSED(seq_id); GGML_UNUSED(feat);
-    GGML_UNUSED(n_rows); GGML_UNUSED(n_embd_cap); GGML_UNUSED(pos);
-    return false;
+    if (spec == nullptr) {
+        return false;
+    }
+
+    bool any = false;
+    for (auto & impl : spec->impls) {
+        if (impl->stage_test_ctx_feat(seq_id, feat, n_rows, n_embd_cap, pos)) {
+            any = true;
+        }
+    }
+
+    return any;
 }

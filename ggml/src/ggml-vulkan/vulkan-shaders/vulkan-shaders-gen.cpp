@@ -804,6 +804,11 @@ void process_shaders() {
     string_to_spv("rms_norm_back_f32", "rms_norm_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("l2_norm_f32", "l2_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
 
+    // B570 v4: fused RMS_NORM->MUL (lab-style standalone shader) + vectorized Q1_0/Q2_0 mmvq
+    string_to_spv("rms_norm_mul_b570", "rms_norm_mul.comp", {});
+    string_to_spv("mul_mat_vec_q1_0_vec", "mul_mat_vec_q1_0_vec.comp", {});
+    string_to_spv("mul_mat_vec_q2_0_vec", "mul_mat_vec_q2_0_vec.comp", {});
+
     string_to_spv("cpy_f32_f32", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("cpy_f32_f16", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}});
     string_to_spv("cpy_f16_f16", "copy.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"OPTIMIZATION_ERROR_WORKAROUND", "1"}});

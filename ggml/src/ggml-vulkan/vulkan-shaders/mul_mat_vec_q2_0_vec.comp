@@ -1,0 +1,140 @@
+// mul_mat_vec_q2_0_vec.comp — B570 v4: mmvq vetorizado para Q2_0 (g64, ternário)
+//
+// Irmão do mul_mat_vec_q1_0_vec.comp para o Ternary-Bonsai Q2_0.
+// Mesmas técnicas: loads largos (uint4 por bloco), unpack por shifts,
+// ativação Q8_1, stride coalescido, redução por subgroup.
+//
+// FORMATO ASSUMIDO — CONFIRMAR com o ggml_vec_dot_q2_0_q8_1 de referência do fork:
+//   #define QK2_0 64
+//   typedef struct { half d; uint8_t qs[QK2_0/4]; } block_q2_0;  // 18 bytes
+//   q_i = (qs >> 2i) & 3 ; valor_i = (q_i - 1) * d   (ternário: q in {0,1,2})
+//   dot(bloco) = Σ_sub [ d * d8_sub * Σ_i (q_i-1)*q8_i ]
+// Se o fork usar (q*d + m) assimétrico ou QK diferente, ajustar block_dot.
+
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+#define QK2_0 64
+#define QK8_1 32
+#define Q2_0_BLOCK_BYTES 18          // 2 (d fp16) + 16 (qs) por 64 valores
+#define Q2_0_Q8_PER_BLOCK (QK2_0 / QK8_1)   // 2
+
+layout (push_constant) uniform parameters {
+    uint ne00;
+    uint ne01;
+    uint ne10;
+    uint stride00;      // stride de linha de A em BYTES
+    uint batch_offset;  // em blocos q8_1
+} p;
+
+layout (binding = 0) readonly buffer A { uint data_a[]; };
+layout (binding = 1) readonly buffer B { uint data_b[]; };
+layout (binding = 2) writeonly buffer D { float data_d[]; };
+
+#define Q8_1_BLOCK_WORDS 9
+
+float q8_1_d(uint block_idx) {
+    return float(unpackHalf2x16(data_b[block_idx * Q8_1_BLOCK_WORDS]).x);
+}
+int q8_1_q(uint block_idx, uint i) {
+    uint w = data_b[block_idx * Q8_1_BLOCK_WORDS + 1 + (i >> 2)];
+    return int(int8_t((w >> ((i & 3u) * 8u)) & 0xFFu));
+}
+
+struct block_q2_0 {
+    float16_t d;
+    uvec4 qs;   // 128 bits = 64 valores de 2 bits
+};
+
+block_q2_0 load_block_q2_0(uint row_base_byte, uint block_idx) {
+    uint byte_off = row_base_byte + block_idx * Q2_0_BLOCK_BYTES;
+    uint w0 = byte_off >> 2;
+    uint sh = (byte_off & 3u) * 8u;
+
+    // 18 bytes = 4.5 words -> ler 6 words e remontar 5 (só sh==3 precisa da 6ª;
+    // ler sempre simplifica o controle). NOTA DE BORDA: o último bloco da última
+    // linha pode ler até 6 bytes além do tamanho lógico; alocações Vulkan são
+    // arredondadas p/ granularidade de memória (>= 256 B), então fica dentro da
+    // alocação. Se o driver reclamar, clamp o índice w0+5.
+    uint w[6];
+    [[unroll]] for (uint k = 0u; k < 6u; ++k) { w[k] = data_a[w0 + k]; }
+
+    uint x[5];
+    if (sh == 0u) {
+        [[unroll]] for (uint k = 0u; k < 5u; ++k) { x[k] = w[k]; }
+    } else {
+        [[unroll]] for (uint k = 0u; k < 5u; ++k) {
+            x[k] = (w[k] >> sh) | (w[k + 1u] << (32u - sh));
+        }
+    }
+    // layout: bytes 0..1 = d, bytes 2..17 = qs[0..15]
+    block_q2_0 b;
+    b.d    = float16_t(unpackHalf2x16(x[0]).x);
+    b.qs.x = (x[0] >> 16) | (x[1] << 16);
+    b.qs.y = (x[1] >> 16) | (x[2] << 16);
+    b.qs.z = (x[2] >> 16) | (x[3] << 16);
+    b.qs.w = (x[3] >> 16) | (x[4] << 16);
+    return b;
+}
+
+// sub-bloco de 32 valores = 1 word de qs (32 x 2 bits = 64 bits = 2 words)
+int sub_sumi_q2_0(uint wlo, uint whi, uint q8_block) {
+    int sumi = 0;
+    [[unroll]] for (uint j = 0u; j < 16u; j += 4u) {
+        sumi += (int((wlo >> ((j+0u)*2u)) & 3u) - 1) * q8_1_q(q8_block, j+0u);
+        sumi += (int((wlo >> ((j+1u)*2u)) & 3u) - 1) * q8_1_q(q8_block, j+1u);
+        sumi += (int((wlo >> ((j+2u)*2u)) & 3u) - 1) * q8_1_q(q8_block, j+2u);
+        sumi += (int((wlo >> ((j+3u)*2u)) & 3u) - 1) * q8_1_q(q8_block, j+3u);
+    }
+    [[unroll]] for (uint j = 0u; j < 16u; j += 4u) {
+        sumi += (int((whi >> ((j+0u)*2u)) & 3u) - 1) * q8_1_q(q8_block, 16u+j+0u);
+        sumi += (int((whi >> ((j+1u)*2u)) & 3u) - 1) * q8_1_q(q8_block, 16u+j+1u);
+        sumi += (int((whi >> ((j+2u)*2u)) & 3u) - 1) * q8_1_q(q8_block, 16u+j+2u);
+        sumi += (int((whi >> ((j+3u)*2u)) & 3u) - 1) * q8_1_q(q8_block, 16u+j+3u);
+    }
+    return sumi;
+}
+
+float block_dot_q2_0_q8_1(uvec4 qs, uint q8_block0) {
+    // valores 0..31 em qs.xy (primeiros 32 x 2 bits), valores 32..63 em qs.zw
+    int sumi0 = sub_sumi_q2_0(qs.x, qs.y, q8_block0);
+    int sumi1 = sub_sumi_q2_0(qs.z, qs.w, q8_block0 + 1u);
+    return q8_1_d(q8_block0) * float(sumi0) + q8_1_d(q8_block0+1u) * float(sumi1);
+}
+
+layout (local_size_x = 128) in;
+
+shared float tmps[32];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg   = gl_SubgroupID;
+
+    const uint nblocks = p.ne00 / QK2_0;
+    const uint row_base_byte = row * p.stride00;
+    const uint WG = gl_WorkGroupSize.x;
+
+    float partial = 0.0;
+
+    for (uint blk = tid; blk < nblocks; blk += WG) {
+        block_q2_0 b = load_block_q2_0(row_base_byte, blk);
+        uint q8blk = p.batch_offset + blk * Q2_0_Q8_PER_BLOCK;
+        partial += float(b.d) * block_dot_q2_0_q8_1(b.qs, q8blk);
+    }
+
+    partial = subgroupAdd(partial);
+    if (lane == 0u) { tmps[sg] = partial; }
+    barrier();
+    if (sg == 0u) {
+        float v = (lane < gl_NumSubgroups) ? tmps[lane] : 0.0;
+        v = subgroupAdd(v);
+        if (lane == 0u) { data_d[row] = v; }
+    }
+}

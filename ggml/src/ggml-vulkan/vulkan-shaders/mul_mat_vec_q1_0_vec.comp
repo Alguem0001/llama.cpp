@@ -1,0 +1,140 @@
+// mul_mat_vec_q1_0_vec.comp — B570 v4: mmvq vetorizado para Q1_0 (g64)
+//
+// Objetivo: decode TG em modelos Bonsai Q1_0 no Intel Arc B570 (Xe2, Vulkan).
+// O mmvq genérico atinge ~40% da banda no 27B (36 t/s vs teto ~90 t/s).
+// Este shader mira 60-80% da banda com:
+//   1) loads largos (uvec2 por bloco de pesos) em vez de byte-a-byte;
+//   2) unpack por bit-twiddling em registrador, sem shared memory p/ pesos;
+//   3) ativação Q8_1 do cache existente (dot q1_0 x q8_1);
+//   4) threads varrem blocos com stride = WG (coalescido); unroll x2 opcional.
+//      NÃO usar unroll x4 / 1-lane-por-bloco: o lab mediu regressão (VDR4)
+//      e nossa v1/XL confirmaram "maior != mais rápido" no Battlemage.
+//
+// FORMATO ASSUMIDO — CONFIRMAR com o ggml_vec_dot_q1_0_q8_1 de referência do fork:
+//   #define QK1_0 64
+//   typedef struct { half d; uint8_t qs[QK1_0/8]; } block_q1_0;  // 10 bytes
+//   valor_i = (bit_i ? +1 : -1) * d              (binário simétrico)
+//   dot(bloco) = Σ_sub [ d * d8_sub * Σ_i(sign_i * q8_i) ]   (2 sub-blocos de 32)
+// Se o fork usar offset/min ou QK diferente, só load_block_q1_0/block_sumi mudam.
+
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+#define QK1_0 64
+#define QK8_1 32
+#define Q1_0_BLOCK_BYTES 10          // 2 (d fp16) + 8 (qs) por 64 valores
+#define Q1_0_Q8_PER_BLOCK (QK1_0 / QK8_1)   // 2
+
+layout (push_constant) uniform parameters {
+    uint ne00;          // K = elementos por linha de A
+    uint ne01;          // N = linhas de A
+    uint ne10;          // tokens em B (mmvq: 1..8; v4 processa 1 token por dispatch)
+    uint stride00;      // stride de linha de A em BYTES
+    uint batch_offset;  // offset do token no buffer B, em blocos q8_1
+} p;
+
+layout (binding = 0) readonly buffer A { uint data_a[]; };   // pesos Q1_0
+layout (binding = 1) readonly buffer B { uint data_b[]; };   // ativação Q8_1
+layout (binding = 2) writeonly buffer D { float data_d[]; }; // saída F32
+
+// ---- Q8_1: block_q8_1 = { float16 d; float16 s; int8 qs[32]; } = 36 bytes = 9 words
+#define Q8_1_BLOCK_WORDS 9
+
+float q8_1_d(uint block_idx) {
+    return float(unpackHalf2x16(data_b[block_idx * Q8_1_BLOCK_WORDS]).x);
+}
+int q8_1_q(uint block_idx, uint i) {
+    uint w = data_b[block_idx * Q8_1_BLOCK_WORDS + 1 + (i >> 2)];
+    return int(int8_t((w >> ((i & 3u) * 8u)) & 0xFFu));
+}
+
+// ---- Q1_0: bloco de 10 bytes pode cruzar fronteira de word -> remontagem manual
+struct block_q1_0 {
+    float16_t d;
+    uvec2 qs;   // 64 bits = 64 valores de 1 bit
+};
+
+// NOTA DE BORDA: quando sh != 0 o último bloco da última linha pode ler até
+// 2 bytes além do tamanho lógico do buffer. Alocações Vulkan são arredondadas
+// para a granularidade de memória (>= 256 B), então na prática a leitura fica
+// dentro da alocação. Se o driver reclamar (robustBufferAccess), clamp o w0+3.
+block_q1_0 load_block_q1_0(uint row_base_byte, uint block_idx) {
+    uint byte_off = row_base_byte + block_idx * Q1_0_BLOCK_BYTES;
+    uint w0 = byte_off >> 2;
+    uint sh = (byte_off & 3u) * 8u;
+
+    uint wa = data_a[w0];
+    uint wb = data_a[w0 + 1];
+    uint wc = data_a[w0 + 2];
+    uint x0, x1, x2;
+    if (sh == 0u) {
+        x0 = wa; x1 = wb; x2 = wc;
+    } else {
+        uint wd = data_a[w0 + 3];
+        x0 = (wa >> sh) | (wb << (32u - sh));
+        x1 = (wb >> sh) | (wc << (32u - sh));
+        x2 = (wc >> sh) | (wd << (32u - sh));
+    }
+    // layout do bloco: bytes 0..1 = d, bytes 2..9 = qs[0..7]
+    block_q1_0 b;
+    b.d    = float16_t(unpackHalf2x16(x0).x);
+    b.qs.x = (x0 >> 16) | (x1 << 16);   // qs[0..3]
+    b.qs.y = (x1 >> 16) | (x2 << 16);   // qs[4..7]
+    return b;
+}
+
+// dot de UM bloco q1_0 (64 valores) com 2 sub-blocos q8_1, exato:
+// Σ_sub [ d8_sub * Σ_i sign_i*q8_i ]  (d_a aplicado fora)
+float block_dot_q1_0_q8_1(uvec2 qs, uint q8_block0) {
+    int sumi0 = 0, sumi1 = 0;
+    [[unroll]] for (uint j = 0u; j < 32u; j += 4u) {
+        sumi0 += (int((qs.x >> (j+0u)) & 1u) * 2 - 1) * q8_1_q(q8_block0, j+0u);
+        sumi0 += (int((qs.x >> (j+1u)) & 1u) * 2 - 1) * q8_1_q(q8_block0, j+1u);
+        sumi0 += (int((qs.x >> (j+2u)) & 1u) * 2 - 1) * q8_1_q(q8_block0, j+2u);
+        sumi0 += (int((qs.x >> (j+3u)) & 1u) * 2 - 1) * q8_1_q(q8_block0, j+3u);
+        sumi1 += (int((qs.y >> (j+0u)) & 1u) * 2 - 1) * q8_1_q(q8_block0+1u, j+0u);
+        sumi1 += (int((qs.y >> (j+1u)) & 1u) * 2 - 1) * q8_1_q(q8_block0+1u, j+1u);
+        sumi1 += (int((qs.y >> (j+2u)) & 1u) * 2 - 1) * q8_1_q(q8_block0+1u, j+2u);
+        sumi1 += (int((qs.y >> (j+3u)) & 1u) * 2 - 1) * q8_1_q(q8_block0+1u, j+3u);
+    }
+    return q8_1_d(q8_block0) * float(sumi0) + q8_1_d(q8_block0 + 1u) * float(sumi1);
+}
+
+layout (local_size_x = 128) in;   // LARGE: 4 subgroups x32 (Xe2); testar 64/256 no bench
+
+shared float tmps[32];   // até 32 subgrupos
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg   = gl_SubgroupID;
+
+    const uint nblocks = p.ne00 / QK1_0;
+    const uint row_base_byte = row * p.stride00;
+    const uint WG = gl_WorkGroupSize.x;
+
+    float partial = 0.0;
+
+    // passo coalescido: threads adjacentes leem blocos adjacentes
+    for (uint blk = tid; blk < nblocks; blk += WG) {
+        block_q1_0 b = load_block_q1_0(row_base_byte, blk);
+        uint q8blk = p.batch_offset + blk * Q1_0_Q8_PER_BLOCK;
+        partial += float(b.d) * block_dot_q1_0_q8_1(b.qs, q8blk);
+    }
+
+    // redução: subgroup -> shared -> subgroup 0
+    partial = subgroupAdd(partial);
+    if (lane == 0u) { tmps[sg] = partial; }
+    barrier();
+    if (sg == 0u) {
+        float v = (lane < gl_NumSubgroups) ? tmps[lane] : 0.0;
+        v = subgroupAdd(v);
+        if (lane == 0u) { data_d[row] = v; }
+    }
+}

@@ -17,6 +17,9 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include "gguf.h"
+#include "../../src/llama-ext.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -52,6 +55,64 @@ static uint32_t server_n_outputs_max(const common_params & params) {
     const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
 
     return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
+}
+
+// dspark target_layers is an array KV; llama_model string meta skips arrays.
+// Read from drafter GGUF (same approach as tests/test-dspark-real-eval.cpp).
+static std::vector<int32_t> server_read_dspark_target_layers(const std::string & drafter_path) {
+    struct gguf_init_params gp = { /* .no_alloc = */ true, /* .ctx = */ nullptr };
+    gguf_context * gctx = gguf_init_from_file(drafter_path.c_str(), gp);
+    if (gctx == nullptr) {
+        return {};
+    }
+
+    std::vector<int32_t> out;
+
+    const int64_t arch_kid = gguf_find_key(gctx, "general.architecture");
+    if (arch_kid >= 0) {
+        const std::string key = std::string(gguf_get_val_str(gctx, arch_kid)) + ".dspark.target_layers";
+        const int64_t kid = gguf_find_key(gctx, key.c_str());
+        if (kid >= 0 && gguf_get_kv_type(gctx, kid) == GGUF_TYPE_ARRAY) {
+            const enum gguf_type arr_type = gguf_get_arr_type(gctx, kid);
+            const size_t         n        = gguf_get_arr_n(gctx, kid);
+            const void *         data     = gguf_get_arr_data(gctx, kid);
+            out.reserve(n);
+            for (size_t i = 0; i < n; i++) {
+                switch (arr_type) {
+                    case GGUF_TYPE_INT32:  out.push_back(((const int32_t  *) data)[i]); break;
+                    case GGUF_TYPE_UINT32: out.push_back((int32_t) ((const uint32_t *) data)[i]); break;
+                    case GGUF_TYPE_INT64:  out.push_back((int32_t) ((const int64_t  *) data)[i]); break;
+                    case GGUF_TYPE_UINT64: out.push_back((int32_t) ((const uint64_t *) data)[i]); break;
+                    default: out.clear(); i = n; break;
+                }
+            }
+        }
+    }
+
+    gguf_free(gctx);
+    return out;
+}
+
+static uint32_t server_read_dspark_block_size(const std::string & drafter_path) {
+    struct gguf_init_params gp = { /* .no_alloc = */ true, /* .ctx = */ nullptr };
+    gguf_context * gctx = gguf_init_from_file(drafter_path.c_str(), gp);
+    if (gctx == nullptr) {
+        return 0;
+    }
+
+    uint32_t out = 0;
+
+    const int64_t arch_kid = gguf_find_key(gctx, "general.architecture");
+    if (arch_kid >= 0) {
+        const std::string key = std::string(gguf_get_val_str(gctx, arch_kid)) + ".dspark.block_size";
+        const int64_t kid = gguf_find_key(gctx, key.c_str());
+        if (kid >= 0 && gguf_get_kv_type(gctx, kid) == GGUF_TYPE_UINT32) {
+            out = gguf_get_val_u32(gctx, kid);
+        }
+    }
+
+    gguf_free(gctx);
+    return out;
 }
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
@@ -170,6 +231,9 @@ struct server_slot {
 
     // speculative decoding
     common_speculative * spec;
+
+    // capture-type drafters (dspark): disable speculation on n_cmpl child slots
+    bool spec_disabled = false;
 
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
@@ -405,7 +469,7 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        return spec != nullptr && !spec_disabled;
     }
 
     void add_token(const completion_token_output & token) {
@@ -1170,6 +1234,30 @@ private:
                 params_dft.load_progress_callback           = load_progress_callback;
                 params_dft.load_progress_callback_user_data = &load_progress_spec;
 
+                // dspark stages full context + block in one batch -- raise headroom
+                const bool spec_dspark = std::find(params_base.speculative.types.begin(),
+                                                   params_base.speculative.types.end(),
+                                                   COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params_base.speculative.types.end();
+                if (spec_dspark && has_draft) {
+                    const uint32_t block_size = server_read_dspark_block_size(params_base.speculative.draft.mparams.path);
+                    const uint32_t bs = block_size > 0 ? block_size : 7;
+                    const uint32_t n_batch_dspark = (uint32_t) params_dft.n_ctx + bs;
+                    if ((uint32_t) params_dft.n_batch < n_batch_dspark) {
+                        SRV_INF("draft-dspark: raising draft n_batch %d -> %u\n", params_dft.n_batch, n_batch_dspark);
+                        params_dft.n_batch = (int32_t) n_batch_dspark;
+                    }
+                    if ((uint32_t) params_dft.n_ubatch < (uint32_t) params_dft.n_batch) {
+                        params_dft.n_ubatch = params_dft.n_batch;
+                    }
+                    const uint32_t n_out = (uint32_t) params_base.n_parallel * (1 + bs);
+                    if ((uint32_t) params_dft.n_outputs_max < n_out) {
+                        params_dft.n_outputs_max = (int32_t) n_out;
+                    }
+                    if (params_base.speculative.draft.n_max < (int32_t) bs) {
+                        params_base.speculative.draft.n_max = (int32_t) bs;
+                    }
+                }
+
                 spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
                 model_dft = spec_init->model();
                 ctx_dft   = spec_init->context();
@@ -1283,8 +1371,41 @@ private:
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
         }
 
+        // dspark needs multi-layer tap capture on the target for every decode
+        if (spec && common_speculative_need_embd_capture(spec.get())) {
+            const std::string & drafter_path = params_base.speculative.draft.mparams.path;
+
+            const uint32_t block_size = server_read_dspark_block_size(drafter_path);
+            if (block_size > 0) {
+                // size draft context for full-block + long context staging
+                const uint32_t n_out_dspark = (uint32_t) params_base.n_parallel * (1 + block_size);
+                // note: draft ctx already created; log if n_max mismatch
+                if ((uint32_t) std::max(0, params_base.speculative.draft.n_max) != block_size) {
+                    SRV_WRN("draft-dspark: --spec-draft-n-max (%d) should equal drafter block_size (%u); clamping n_max\n",
+                            params_base.speculative.draft.n_max, block_size);
+                    params_base.speculative.draft.n_max = (int32_t) block_size;
+                }
+                (void) n_out_dspark;
+            }
+
+            const std::vector<int32_t> capture_layers = server_read_dspark_target_layers(drafter_path);
+            if (capture_layers.empty()) {
+                SRV_ERR("draft-dspark: failed to read dspark.target_layers from '%s' -- disabling speculative decoding\n",
+                        drafter_path.c_str());
+                spec.reset();
+            } else {
+                llama_set_capture_layers(ctx_tgt, capture_layers.data(), capture_layers.size(), /* masked = */ false);
+                SRV_INF("draft-dspark: target tap capture engaged on %zu layers\n", capture_layers.size());
+
+                if (params_base.ctx_shift) {
+                    params_base.ctx_shift = false;
+                    SRV_WRN("%s\n", "ctx_shift is not supported with draft-dspark capture, it will be disabled");
+                }
+            }
+        }
+
         if (spec) {
-            SRV_TRC("%s", "speculative decoding context initialized\n");
+            SRV_INF("%s", "speculative decoding context initialized\n");
         } else {
             spec_init.reset();
             ctx_dft   = nullptr;
@@ -1786,6 +1907,11 @@ private:
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+
+        // capture-type drafters: child slots do not clone per-seq capture state
+        slot.spec_disabled = slot.task->is_child() &&
+                             slot.spec != nullptr &&
+                             common_speculative_need_embd_capture(slot.spec);
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -3074,6 +3200,12 @@ private:
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
+                        // dspark: begin() clears staged capture window -- run BEFORE prompt decode
+                        // so process() can stage capture rows for every prompt position.
+                        if (slot.can_speculate() && common_speculative_need_embd_capture(spec.get())) {
+                            common_speculative_begin(spec.get(), slot.id, slot.task->tokens.get_text_tokens());
+                        }
+
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
 
@@ -3144,7 +3276,14 @@ private:
                                 return;
                             }
 
-                            if (slot.task->params.cache_prompt) {
+                            // dspark needs a capture row for every prompt position -- skip cache reuse
+                            const bool spec_needs_full_prompt = slot.can_speculate() &&
+                                common_speculative_need_embd_capture(spec.get());
+                            if (spec_needs_full_prompt && slot.task->params.cache_prompt) {
+                                SLT_DBG(slot, "%s", "draft-dspark: disabling prompt cache reuse (capture rows needed)\n");
+                            }
+
+                            if (slot.task->params.cache_prompt && !spec_needs_full_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
@@ -3729,7 +3868,8 @@ private:
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
 
-                if (slot.can_speculate()) {
+                // non-capture drafters begin after prompt; dspark already began before prompt decode
+                if (slot.can_speculate() && !common_speculative_need_embd_capture(spec.get())) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {

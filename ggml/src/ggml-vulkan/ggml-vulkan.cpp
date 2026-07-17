@@ -487,6 +487,7 @@ vk_conv_block_size vk_conv_block_sizes[CONV_SHAPE_COUNT] = {
 enum dmmv_wg_sizes {
     DMMV_WG_SIZE_SUBGROUP,
     DMMV_WG_SIZE_LARGE,
+    DMMV_WG_SIZE_XL,      // v3 experiment: subgroup*8 — only via GGML_VK_B570_MMVQ_XL=1
     DMMV_WG_SIZE_COUNT,
 };
 
@@ -746,8 +747,13 @@ struct vk_device_struct {
     int32_t mmvq_mode;
 
     // ARC-SPEED: Battlemage B570/Xe2 optimized kernel profile (FA + mmvq + warptiles)
-    // Toggle: GGML_VK_B570_KERNEL=0|1|off|on  (default ON when architecture==INTEL_XE2)
-    bool b570_kernel {};
+    // Modes: 0=off, 1=v2, 2=v3 (mmvq-id), 3=v4 (DEFAULT on Xe2: v3 + mmvq_vec + fuse_rmsnorm_mul)
+    // Toggle: GGML_VK_B570_KERNEL=0|1|2|3  (default INTEL_XE2: 3 = v4)
+    int  b570_mode  {};   // 0 | 1 | 2 | 3
+    bool b570_kernel {};  // derivado: b570_mode >= 1 — mantém TODOS os ifs da v2 intactos
+    // v4 deltas (default ON no modo 3; override por env)
+    bool b570_mmvq_vec {};         // shaders mul_mat_vec_q{1,2}_0_vec
+    bool b570_fuse_rmsnorm_mul {}; // fusão RMS_NORM->MUL (enable Intel path + pipeline B570)
 
     bool subgroup_size_control;
     uint32_t subgroup_min_size;
@@ -886,6 +892,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_mul_rope_f32_f16;
     vk_pipeline pipeline_rms_norm_back_f32;
     vk_pipeline pipeline_l2_norm_f32;
+    // B570 v4 experimental pipelines (standalone shaders; created when flags on)
+    vk_pipeline pipeline_rms_norm_mul_b570;      // rms_norm_mul.comp
+    vk_pipeline pipeline_mul_mat_vec_q1_0_vec;  // mul_mat_vec_q1_0_vec.comp
+    vk_pipeline pipeline_mul_mat_vec_q2_0_vec;  // mul_mat_vec_q2_0_vec.comp
 
     // [src/dst 0=fp32,1=fp16]
     vk_pipeline pipeline_exp[2];
@@ -3434,24 +3444,51 @@ struct vk_fa_tuning_params {
 static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type);
 static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type = GGML_TYPE_F16);
 
-// B570 / Xe2 kernel profile — default ON for INTEL_XE2; override with GGML_VK_B570_KERNEL=0|1
-static bool ggml_vk_b570_kernel_from_env(vk_device_architecture arch) {
+// B570 / Xe2 kernel profile — 0=off, 1=v2, 2=v3, 3=v4.
+// DEFAULT em INTEL_XE2: v4 (3). Fallback: GGML_VK_B570_KERNEL=2|1|0.
+// GGML_VK_ARC_FA_LEGACY força path upstream (modo 0).
+static int ggml_vk_b570_kernel_mode_from_env(vk_device_architecture arch) {
     const char * e = getenv("GGML_VK_B570_KERNEL");
     if (e != nullptr) {
         if (e[0] == '0' || strcmp(e, "off") == 0 || strcmp(e, "OFF") == 0 ||
             strcmp(e, "normal") == 0 || strcmp(e, "NORMAL") == 0) {
-            return false;
+            return 0;
         }
-        if (e[0] == '1' || strcmp(e, "on") == 0 || strcmp(e, "ON") == 0 ||
+        if (e[0] == '1' || strcmp(e, "v2") == 0 || strcmp(e, "V2") == 0) {
+            return 1;
+        }
+        if (e[0] == '2' || strcmp(e, "v3") == 0 || strcmp(e, "V3") == 0) {
+            return 2;
+        }
+        // on/opt/v4/3 → v4 (perfil atual padrão)
+        if (e[0] == '3' || strcmp(e, "v4") == 0 || strcmp(e, "V4") == 0 ||
+            strcmp(e, "on") == 0 || strcmp(e, "ON") == 0 ||
             strcmp(e, "opt") == 0 || strcmp(e, "OPT") == 0) {
-            return true;
+            return 3;
         }
     }
     // Legacy env still forces upstream FA path (implies no B570 kernel for FA)
     if (getenv("GGML_VK_ARC_FA_LEGACY") != nullptr) {
+        return 0;
+    }
+    return arch == INTEL_XE2 ? 3 : 0;
+}
+
+// v4 individual toggles (default ON only when mode >= 3)
+static bool ggml_vk_b570_env_flag(const char * name, bool def) {
+    const char * env = getenv(name);
+    if (env == nullptr) {
+        return def;
+    }
+    if (env[0] == '0' || strcmp(env, "off") == 0 || strcmp(env, "OFF") == 0 ||
+        strcmp(env, "false") == 0 || strcmp(env, "FALSE") == 0) {
         return false;
     }
-    return arch == INTEL_XE2;
+    if (env[0] == '1' || strcmp(env, "on") == 0 || strcmp(env, "ON") == 0 ||
+        strcmp(env, "true") == 0 || strcmp(env, "TRUE") == 0) {
+        return true;
+    }
+    return def;
 }
 
 static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
@@ -4967,8 +5004,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #endif
 
     for (uint32_t w = 0; w < DMMV_WG_SIZE_COUNT; ++w) {
-        const uint32_t wg_size_subgroup   = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size : (subgroup_size * 4);
-        const uint32_t wg_size_subgroup16 = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size16 : (subgroup_size16 * 4);
+        // SUBGROUP → sg; LARGE → sg*4; XL → sg*8 (v3 experiment)
+        const uint32_t wg_mul = (w == DMMV_WG_SIZE_SUBGROUP) ? 1u : (w == DMMV_WG_SIZE_LARGE) ? 4u : 8u;
+        const uint32_t wg_size_subgroup   = subgroup_size   * wg_mul;
+        const uint32_t wg_size_subgroup16 = subgroup_size16 * wg_mul;
 
         const shader_reduction_mode reduc = (use_subgroups && w == DMMV_WG_SIZE_SUBGROUP) ? SHADER_REDUCTION_MODE_SUBGROUP :
                                             (use_subgroups && w == DMMV_WG_SIZE_LARGE) ? SHADER_REDUCTION_MODE_HYBRID :
@@ -5036,7 +5075,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
             if (device->integer_dot_product) {
                 const uint32_t subgroup_size_int = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control) ? device->subgroup_min_size : device->subgroup_size;
-                const uint32_t wg_size_subgroup_int = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size_int : (subgroup_size_int * 4);
+                const uint32_t wg_mul_int = (w == DMMV_WG_SIZE_SUBGROUP) ? 1u : (w == DMMV_WG_SIZE_LARGE) ? 4u : 8u;
+                const uint32_t wg_size_subgroup_int = subgroup_size_int * wg_mul_int;
 
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_q8_1_f32", arr_dmmv_q2_0_q8_1_f32_len[reduc], arr_dmmv_q2_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_q8_1_f32", arr_dmmv_q4_0_q8_1_f32_len[reduc], arr_dmmv_q4_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
@@ -5090,7 +5130,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
         if (device->integer_dot_product) {
             const uint32_t subgroup_size_int = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control) ? device->subgroup_min_size : device->subgroup_size;
-            const uint32_t wg_size_subgroup_int = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size_int : (subgroup_size_int * 4);
+            const uint32_t wg_mul_int = (w == DMMV_WG_SIZE_SUBGROUP) ? 1u : (w == DMMV_WG_SIZE_LARGE) ? 4u : 8u;
+            const uint32_t wg_size_subgroup_int = subgroup_size_int * wg_mul_int;
 
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q2_0], "mul_mat_vec_id_q2_0_q8_1_f32", arr_dmmv_id_q2_0_q8_1_f32_len[reduc], arr_dmmv_id_q2_0_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_kq_int}, 1, true, use_subgroups, subgroup_size_int);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q4_0], "mul_mat_vec_id_q4_0_q8_1_f32", arr_dmmv_id_q4_0_q8_1_f32_len[reduc], arr_dmmv_id_q4_0_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int}, 1, true, use_subgroups, subgroup_size_int);
@@ -5243,6 +5284,26 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_back_f32, "rms_norm_back_f32", rms_norm_back_f32_len, rms_norm_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_l2_norm_f32, "l2_norm_f32", l2_norm_f32_len, l2_norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
+
+    // B570 v4: standalone fused RMS_NORM->MUL + vectorized Q1_0/Q2_0 mmvq shaders
+    // Created when flags are on. ABI of *_vec shaders differs from generic mmvq
+    // (push constants); full dispatch path is experimental — pipelines are built
+    // and ready; selection hooks use them only when GGML_VK_B570_MMVQ_VEC=1.
+    if (device->b570_fuse_rmsnorm_mul) {
+        // push: uint ncols, uint nrows, float eps, uint stride_x  (4*4 = 16 bytes)
+        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_b570, "rms_norm_mul_b570",
+                                rms_norm_mul_b570_len, rms_norm_mul_b570_data, "main",
+                                3, 16, {1, 1, 1}, {}, 1);
+    }
+    if (device->b570_mmvq_vec) {
+        // push: ne00,ne01,ne10,stride00,batch_offset (5*uint32 = 20 bytes); WG 128
+        ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_q1_0_vec, "mul_mat_vec_q1_0_vec",
+                                mul_mat_vec_q1_0_vec_len, mul_mat_vec_q1_0_vec_data, "main",
+                                3, 20, {1, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_q2_0_vec, "mul_mat_vec_q2_0_vec",
+                                mul_mat_vec_q2_0_vec_len, mul_mat_vec_q2_0_vec_data, "main",
+                                3, 20, {1, 1, 1}, {}, 1);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_f32, "cpy_f32_f32", cpy_f32_f32_len, cpy_f32_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_f16, "cpy_f32_f16", cpy_f32_f16_len, cpy_f32_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
@@ -6727,6 +6788,15 @@ static vk_device ggml_vk_get_device(size_t idx) {
         descriptor_set_layout_create_info.setPNext(&dslbfci);
         device->dsl = device->device.createDescriptorSetLayout(descriptor_set_layout_create_info);
 
+        // B570 mode/flags MUST be set before load_shaders (v4 pipelines are conditional)
+        device->disable_fusion = getenv("GGML_VK_DISABLE_FUSION") != nullptr;
+        device->b570_mode   = ggml_vk_b570_kernel_mode_from_env(device->architecture);
+        device->b570_kernel = device->b570_mode >= 1;
+        device->b570_mmvq_vec =
+            ggml_vk_b570_env_flag("GGML_VK_B570_MMVQ_VEC", device->b570_mode >= 3);
+        device->b570_fuse_rmsnorm_mul =
+            ggml_vk_b570_env_flag("GGML_VK_B570_FUSE_RMSNORM_MUL", device->b570_mode >= 3);
+
         ggml_vk_load_shaders(device);
 
         // Prefer a dedicated transfer queue on AMD dGPUs (non-GCN) when graphics queue use is disabled.
@@ -6759,11 +6829,13 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         device->idx = idx;
 
-        device->disable_fusion = getenv("GGML_VK_DISABLE_FUSION") != nullptr;
-
         device->add_rms_fusion = !device->disable_fusion &&
                                  device->subgroup_arithmetic &&
                                  device->vendor_id != VK_VENDOR_ID_INTEL;
+        // v4: allow RMS_NORM->MUL fusion on Intel Arc when flag is set (upstream disables Intel)
+        if (device->b570_fuse_rmsnorm_mul && !device->disable_fusion && device->subgroup_arithmetic) {
+            device->add_rms_fusion = true;
+        }
         device->partials_binding_alignment =
             std::max(4u, (uint32_t)device->properties.limits.minStorageBufferOffsetAlignment);
 
@@ -6773,13 +6845,18 @@ static vk_device ggml_vk_get_device(size_t idx) {
         } else if (getenv("GGML_VK_FORCE_MMVQ")) {
             device->mmvq_mode = 1;
         }
-
-        device->b570_kernel = ggml_vk_b570_kernel_from_env(device->architecture);
         // Do NOT force mmvq_mode=1 — that regressed TG in B570 v1 benches.
 
-        std::cerr << "ggml_vulkan: B570 optimized kernel: "
-                  << (device->b570_kernel ? "ON (v2)" : "OFF (normal)")
-                  << "  [toggle: GGML_VK_B570_KERNEL=0|1]" << std::endl;
+        const char * mode_str =
+            device->b570_mode == 3 ? "ON (v4)" :
+            device->b570_mode == 2 ? "ON (v3)" :
+            device->b570_mode == 1 ? "ON (v2)" : "OFF (normal)";
+        std::cerr << "ggml_vulkan: B570 optimized kernel: " << mode_str;
+        if (device->b570_mode >= 3 || device->b570_mmvq_vec || device->b570_fuse_rmsnorm_mul) {
+            std::cerr << (device->b570_mmvq_vec ? " +mmvq_vec" : "")
+                      << (device->b570_fuse_rmsnorm_mul ? " +rmsnorm_mul" : "");
+        }
+        std::cerr << "  [toggle: GGML_VK_B570_KERNEL=0|1|2|3]" << std::endl;
 
         return device;
     }
@@ -7540,9 +7617,11 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
         }
-        // Bonsai quants: always LARGE on decode
+        // Bonsai quants: always LARGE on decode (v3 XL experiment via GGML_VK_B570_MMVQ_XL=1)
         if (b570 && (a_type == GGML_TYPE_Q1_0 || a_type == GGML_TYPE_Q2_0) && m <= 8 && k >= 512) {
-            dmmv_wg = DMMV_WG_SIZE_LARGE;
+            const bool b570_v3 = ctx->device->b570_mode >= 2;
+            dmmv_wg = (b570_v3 && getenv("GGML_VK_B570_MMVQ_XL") != nullptr)
+                ? DMMV_WG_SIZE_XL : DMMV_WG_SIZE_LARGE;
         }
     }
 
@@ -7698,7 +7777,8 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
     // heuristic to choose workgroup size (mul_mat_vec id path)
     uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
     const char * arc_mmvq_wg_id = getenv("GGML_VK_ARC_MMVQ_WG");
-    const bool b570_id = ctx->device->b570_kernel;
+    const bool b570_id    = ctx->device->b570_kernel;      // v2: modos 1|2
+    const bool b570_v3_id = ctx->device->b570_mode >= 2;   // DELTA v3
     if (arc_mmvq_wg_id && (strcmp(arc_mmvq_wg_id, "large") == 0 || strcmp(arc_mmvq_wg_id, "LARGE") == 0)) {
         dmmv_wg = DMMV_WG_SIZE_LARGE;
     } else if (arc_mmvq_wg_id && (strcmp(arc_mmvq_wg_id, "subgroup") == 0 || strcmp(arc_mmvq_wg_id, "SUBGROUP") == 0)) {
@@ -7717,9 +7797,19 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
                 dmmv_wg = DMMV_WG_SIZE_LARGE;
             }
         }
+        // B570 v3: paridade com o path principal — Bonsai quants sempre LARGE no decode.
+        // A v2 só aplicava essa regra em mul_mat_vec; quem passa por mul_mat_vec_id
+        // (MoE/expert/FFN roteado) caía na heurística e perdia o LARGE.
+        // Inócuo para modelos densos que não usam o path id.
+        // XL experiment: GGML_VK_B570_MMVQ_XL=1
+        if (b570_v3_id && (a_type == GGML_TYPE_Q1_0 || a_type == GGML_TYPE_Q2_0) && m <= 8 && k >= 512) {
+            dmmv_wg = (getenv("GGML_VK_B570_MMVQ_XL") != nullptr)
+                ? DMMV_WG_SIZE_XL : DMMV_WG_SIZE_LARGE;
+        }
     }
 
     if (b_type == GGML_TYPE_Q8_1) {
+        // Upstream forces SUBGROUP on all Intel (keep; LARGE on Q8_1 regressed)
         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
         }

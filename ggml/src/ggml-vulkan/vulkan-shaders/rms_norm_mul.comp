@@ -1,0 +1,65 @@
+// rms_norm_mul.comp — B570 v4: fusão RMS_NORM(F32) -> MUL(escala 1D F32)
+//
+// Port para Vulkan da fusão validada no b70-optimization-lab (SYCL):
+//   - quality-preserving (greedy byte-compare idêntico no lab);
+//   - remove 1 launch + 1 round-trip de memória por norm por camada;
+//   - no lab: +1,3% TG single-card, +5,5% em multi-card.
+//
+// y[j] = x[j] * rsqrt(mean(x^2) + eps) * w[j]
+//
+// Matcher (C++): só funde quando
+//   - op MUL cujo src0 é saída de RMS_NORM F32 e src1 é 1D F32 contíguo
+//     (ne[1]==1, nb alinhado), mesmo device, sem split;
+//   - desligar com GGML_VK_B570_FUSE_RMSNORM_MUL=0.
+
+#version 450
+
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout (push_constant) uniform parameters {
+    uint ncols;     // ne00 (features)
+    uint nrows;     // ne01 * ne02 * ne03
+    float eps;
+    uint stride_x;  // stride de linha de X em ELEMENTOS (não bytes)
+} p;
+
+layout (binding = 0) readonly  buffer X { float data_x[]; };
+layout (binding = 1) readonly  buffer W { float data_w[]; };  // escala 1D [ncols]
+layout (binding = 2) writeonly buffer Y { float data_y[]; };
+
+layout (local_size_x = 256) in;
+
+shared float tmps[32];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= p.nrows) { return; }
+
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg   = gl_SubgroupID;
+    const uint base = row * p.stride_x;
+
+    // fase 1: soma dos quadrados (F32 — não usar F16 aqui, o lab mediu regressão)
+    float ssq = 0.0;
+    for (uint j = tid; j < p.ncols; j += gl_WorkGroupSize.x) {
+        float v = data_x[base + j];
+        ssq += v * v;
+    }
+    ssq = subgroupAdd(ssq);
+    if (lane == 0u) { tmps[sg] = ssq; }
+    barrier();
+
+    if (tid == 0u) {
+        float total = 0.0;
+        for (uint s = 0u; s < gl_NumSubgroups; ++s) { total += tmps[s]; }
+        tmps[0] = inversesqrt(total / float(p.ncols) + p.eps);
+    }
+    barrier();
+    const float inv_rms = tmps[0];
+
+    // fase 2: normaliza + aplica escala na escrita (fundido)
+    for (uint j = tid; j < p.ncols; j += gl_WorkGroupSize.x) {
+        data_y[base + j] = data_x[base + j] * inv_rms * data_w[j];
+    }
+}

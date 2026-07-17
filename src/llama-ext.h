@@ -120,6 +120,22 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //
+// multi-layer hidden-state tap (EAGLE3 / dspark target-feature reuse)
+//
+// Register intermediate decoder layers to capture. After decode, per-layer
+// outputs are concatenated per position into a row of width
+// [n_capture_layers * n_embd] in layer_ids order. Pass n_layers == 0 to disable.
+// If masked == false, capture is dense (every batch position) independent of
+// batch.logits -- required by dspark so prompt rows keep logits=false.
+LLAMA_API void     llama_set_capture_layers(struct llama_context * ctx,
+                                            const int32_t *        layer_ids,
+                                            size_t                 n_layers,
+                                            bool                   masked = true);
+LLAMA_API uint32_t llama_get_n_capture(struct llama_context * ctx);
+LLAMA_API float *  llama_get_embeddings_capture    (struct llama_context * ctx);
+LLAMA_API float *  llama_get_embeddings_capture_ith(struct llama_context * ctx, int32_t i);
+
+//
 // model/context data extraction
 //
 

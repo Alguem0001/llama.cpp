@@ -807,10 +807,21 @@ struct llm_graph_params {
             return false;
         }
 
+        if (cparams.n_capture_layers != other.cparams.n_capture_layers ||
+            cparams.embeddings_capture_masked != other.cparams.embeddings_capture_masked) {
+            return false;
+        }
+        for (uint32_t i = 0; i < cparams.n_capture_layers; ++i) {
+            if (cparams.capture_layer_idx[i] != other.cparams.capture_layer_idx[i]) {
+                return false;
+            }
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
+            cparams.embeddings_capture      == other.cparams.embeddings_capture      &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
             arch  == other.arch  &&
             gtype == other.gtype &&
@@ -837,6 +848,7 @@ public:
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
+    ggml_tensor * get_h_capture()   const { return t_h_capture; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
@@ -872,6 +884,7 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_h_capture   = nullptr; // [n_capture * n_embd, n_tokens/n_outputs] multi-layer tap
 
     std::vector<ggml_tensor *> t_layer_inp;
 

@@ -91,6 +91,12 @@ struct llama_context {
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
 
+    // multi-layer hidden-state tap (EAGLE3 / dspark). get_embeddings_capture_ith
+    // returns the concatenated [n_capture * n_embd] row for output position i.
+    float *  get_embeddings_capture();
+    float *  get_embeddings_capture_ith(int32_t i);
+    uint32_t get_n_capture() const;
+
     float * get_embeddings_layer_inp(uint32_t lid);
 
     llama_token * get_sampled_tokens() const;
@@ -118,6 +124,8 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    // register ordered intermediate layers to capture; empty list disables
+    void set_capture_layers(const std::vector<int32_t> & layer_ids, bool masked = true);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -305,6 +313,10 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+
+    // multi-layer capture: [n_outputs or n_batch][n_capture_layers * n_embd]
+    // populated when cparams.n_capture_layers > 0 and the graph fills t_h_capture
+    buffer_view<float> embd_capture = {nullptr, 0};
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
