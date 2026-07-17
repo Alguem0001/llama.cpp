@@ -24,6 +24,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cinttypes>
 #include <climits>
 #include <cstdarg>
@@ -705,6 +706,32 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     postprocess_cpu_params(params.speculative.draft.cpuparams,       &params.cpuparams);
     postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch);
+
+    // -md alone does not enable a draft impl (default types = {none}). Auto-select:
+    //   path contains "dspark" → draft-dspark; otherwise → draft-simple.
+    // Explicit --spec-type always wins (if types already has a non-none entry).
+    if (params.speculative.has_dft()) {
+        bool only_none = true;
+        for (const auto t : params.speculative.types) {
+            if (t != COMMON_SPECULATIVE_TYPE_NONE) {
+                only_none = false;
+                break;
+            }
+        }
+        if (only_none) {
+            const std::string & dpath = params.speculative.draft.mparams.path;
+            std::string dlow = dpath;
+            std::transform(dlow.begin(), dlow.end(), dlow.begin(),
+                           [](unsigned char c) { return (char) std::tolower(c); });
+            const bool is_dspark = dlow.find("dspark") != std::string::npos;
+            params.speculative.types.clear();
+            params.speculative.types.push_back(
+                is_dspark ? COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK
+                          : COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
+            LOG_INF("spec: auto --spec-type %s (from -md path; override with --spec-type)\n",
+                    is_dspark ? "draft-dspark" : "draft-simple");
+        }
+    }
 
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
