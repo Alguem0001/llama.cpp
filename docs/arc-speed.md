@@ -36,20 +36,14 @@ Optional env vars (Vulkan backend):
 |----------|--------|
 | `GGML_VK_DISABLE_COOPMAT=1` | A/B if coopmat is slower on your driver |
 | `GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1` | A/B int-dot path |
-| `GGML_VK_B570_KERNEL=0\|1` | **B570 optimized kernel** (default ON on Xe2). `0` = normal/upstream |
-| `GGML_VK_ARC_FA_LEGACY=1` | Force upstream Intel FA (also disables B570 kernel FA path) |
 | `GGML_VK_ARC_MMVQ_WG=large\|subgroup` | Force mmvq workgroup size |
 | `GGML_VK_FORCE_MMVQ=1` / `GGML_VK_DISABLE_MMVQ=1` | Force / disable mmvq |
 | `GGML_VK_VISIBLE_DEVICES=0` | Force first Vulkan device |
 
-### B570 kernel vs normal (measured)
+### B570 kernel v4 (único perfil)
 
-```text
-1.7B Q2_0:  normal 226.5 tg  →  B570 v2 229.2 tg  (+1.2%)
-27B  Q1_0:  normal 36.0  tg  →  B570 v2 35.9  tg  (~0%)
-```
-
-A/B script: `scripts/arc/bench-b570-kernel.ps1` · full notes: `benches/arc-b570/RESULTS.md`
+On Intel Xe2 / B570 the **v4** profile is always on (no version toggle / no v2–v3 fallback).  
+See `docs/B570-Kernel-v4.md` · bench: `scripts/arc/bench-b570-kernel-v4.ps1`
 
 ### Measured on Arc B570 (2026-07-16, build 1359ad996)
 

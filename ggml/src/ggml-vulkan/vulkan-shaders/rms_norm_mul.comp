@@ -10,7 +10,7 @@
 // Matcher (C++): só funde quando
 //   - op MUL cujo src0 é saída de RMS_NORM F32 e src1 é 1D F32 contíguo
 //     (ne[1]==1, nb alinhado), mesmo device, sem split;
-//   - desligar com GGML_VK_B570_FUSE_RMSNORM_MUL=0.
+//   - parte do perfil v4 (sempre ativo em INTEL_XE2).
 
 #version 450
 
